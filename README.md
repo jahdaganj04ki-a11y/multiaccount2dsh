@@ -43,7 +43,7 @@ npm test
 npm pack
 ```
 
-Daraus entsteht `dsh-multi-account-1.0.0.tgz`. Ein fertiges Release-TGZ
+Daraus entsteht `dsh-multi-account-1.1.0.tgz`. Ein fertiges Release-TGZ
 muss nicht erneut gebaut werden.
 
 ### 2. In DSH Desktop installieren
@@ -66,7 +66,7 @@ die `dsh`-CLI über die Installation bzw. die Shims unter
 `<DSH_HOME>\.desktop-bin` mit. Lokale Pfade müssen absolut sein:
 
 ```powershell
-dsh plugin --profile web add "C:\Pfad\zu\dsh-multi-account-1.0.0.tgz"
+dsh plugin --profile web add "C:\Pfad\zu\dsh-multi-account-1.1.0.tgz"
 ```
 
 Anschließend DSH Desktop vollständig neu starten. Ob die jeweilige
@@ -118,6 +118,29 @@ funktionieren?). Schlägt ein Test fehl, wird der Fehler klassifiziert
 20 s). Ein Timeout-Limit ist über die Plugin-Config
 (`testTimeoutMs`, Standard 20000 ms) anpassbar.
 
+### Modelle testen
+
+Zusätzlich gibt es im Account-Fenster einen Bereich **Modelle** mit
+drei weiteren Test-Ebenen. Ein Modelltest nutzt den jeweils aktuell
+wirksamen Key (aktiver Account bzw. bei Providern ohne verwaltete
+Accounts den in den Modell-Einstellungen gespeicherten Key) und prüft,
+ob das konkrete Modell eine Minimalanfrage annimmt:
+
+- **Einzelnes Modell** — Test-Button (▶) in der Zeile des Modells.
+- **Alle Modelle eines Providers** — „Test all models of this
+  provider“; die Modellliste stammt aus dem Adapter-Katalog
+  (`llm.listModels`), mit Fallback auf die im llm-pi-ai-Profil
+  konfigurierten Modelle.
+- **Alle Modelle aller Provider** — „Test all models of all
+  providers“; durchläuft alle konfigurierbaren Provider (max. 100
+  Prüfungen pro Lauf), auch solche ohne verwaltete Accounts.
+
+Modelltests rotieren keine Accounts (auch nicht im Round-Robin-Modus),
+verändern keinen Credential-Stand und schreiben ihre Ergebnisse
+(Status, Code, Latenz) separat in die `state.json`
+(`modelTests`), sodass keine Provider-Sektion „verwaltet“ wird, nur
+weil ein Modell geprüft wurde.
+
 ### Verhalten der Umschaltmodi
 
 | Modus | Verhalten |
@@ -132,7 +155,8 @@ werden.
 
 ### Wo liegen die Daten?
 
-- Zustand (Accounts, Modus, Status, aktiver Account):
+- Zustand (Accounts, Modus, Status, aktiver Account, Modell- und
+  Account-Testergebnisse):
   `<DSH_HOME>/multi-account/state.json` (Rechte `0600`),
 - die API-Keys selbst bleiben im gehosteten Credential-Store
   (`<DSH_HOME>/.credentials.yaml`) unter generierten Referenzen
@@ -158,7 +182,7 @@ npm test
 npm pack
 ```
 
-This produces `dsh-multi-account-1.0.0.tgz`.
+This produces `dsh-multi-account-1.1.0.tgz`.
 
 ### Install
 
@@ -167,7 +191,7 @@ package” flow, or the bundled `dsh` CLI with an **absolute** tarball
 path:
 
 ```powershell
-dsh plugin --profile web add "C:\path\to\dsh-multi-account-1.0.0.tgz"
+dsh plugin --profile web add "C:\path\to\dsh-multi-account-1.1.0.tgz"
 ```
 
 Then fully quit and reopen DSH Desktop. Check `dsh plugin --help` if a
@@ -202,6 +226,26 @@ Disabled accounts are tested too. Failures are classified (`AUTH`,
 `TIMEOUT`, …); the wall-clock budget is configurable through the
 plugin config (`testTimeoutMs`, default 20000 ms).
 
+### Testing models
+
+The modal also contains a **Models** section with three more scopes. A
+model probe runs on the currently committed key (the active account, or
+the key saved in Models settings for providers without managed
+accounts) and checks that the exact model accepts a minimal request:
+
+- **One model** — the ▸ **Test** button on each model row.
+- **Every model of one provider** — *Test all models of this
+  provider*; the model list comes from the adapter catalog
+  (`llm.listModels`) with an llm-pi-ai profile fallback.
+- **Every model of every provider** — *Test all models of all
+  providers*, walking every configurable provider (capped at 100
+  probes per run), including ones without managed accounts.
+
+Model probes never rotate accounts (not even in round-robin mode),
+never alter the credential store, and persist their results (state,
+code, latency) separately in `state.json` (`modelTests`), so testing a
+model never turns a provider into a managed one.
+
 ### Data locations
 
 - State: `<DSH_HOME>/multi-account/state.json` (mode `0600`),
@@ -218,6 +262,7 @@ plugin config (`testTimeoutMs`, default 20000 ms).
 | UI entry | Keyed client slot `settings.models.provider-card` (one contribution per settings namespace, rendered per provider row), opening a host-`Modal` built from `dsh-client-ui-primitives`. |
 | Client/server transport | Plugin-owned routes under `/api/multi-account.*`, registered with `ctx.connection.fetch.register`; buffered, bounded JSON, no secrets on read responses. |
 | Account tests | `test-account` / `test-provider` / `test-all` routes temporarily commit one key, invoke `ctx.llm.stream` with a one-token probe (marked internally so the plugin's own listener skips rotation), classify the result and always restore the previous credential; per-provider locking serializes the swaps. |
+| Model tests | `models` / `test-model` / `test-provider-models` / `test-all-models` routes resolve models from the adapter catalog (profile fallback) and probe each exact model on the already-committed active key under a second internal marker that suppresses rotation only; results persist in the separate `modelTests` map and the same per-provider lock covers both probe families. |
 | Secret storage | `ctx.credentials.set/unset/resolve`; each account owns a generated credential ref, the active account's value is committed to the provider's own ref (the exact value `llm-pi-ai` resolves per request). |
 | Round robin / enforcement | Prepended global `llm/stream` waterfall listener; rotates the cursor and commits the key before the adapter resolves the credential. |
 | Failover | Prepended global `agent/request-error` waterfall listener; classifies `AUTH`, `INVALID_CREDENTIAL`, `QUOTA`, `ACCOUNT_QUOTA`, `MISSING_CREDENTIAL` and `RATE_LIMIT`, marks the account, rotates and returns `{ kind: 'retry' }` — the same contract as the official `dsh-llm-retry` plugin. A per-step budget prevents retry loops. |

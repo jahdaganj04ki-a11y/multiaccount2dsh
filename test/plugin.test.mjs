@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalCredentialProvider } from '@deepseek-ai/dsh-credentials-local'
 import * as plugin from '../index.js'
 import { StateStore } from '../lib/state-store.js'
-import { TEST_MARKER } from '../lib/protocol.js'
+import { TEST_MARKER, MODEL_TEST_MARKER } from '../lib/protocol.js'
 
 const PROVIDER = 'deepseek'
 const REF = 'DEEPSEEK_API_KEY'
@@ -25,12 +25,13 @@ function mockLlm(entries, options = {}) {
     registerConfigurableProviders: () => ({ replace() {} }),
     listModels: options.noModels
       ? async () => { throw Object.assign(new Error('catalog unavailable'), { code: 'NO_CATALOG' }) }
-      : async (providerId) => [{ provider: providerId, id: 'test-model', name: 'Test Model' }],
+      : async (providerId) => (options.catalogModels?.get(providerId)
+        ?? [{ provider: providerId, id: 'test-model', name: 'Test Model' }]),
     // Mimics the real llm service: returns an async iterable and rejects with
     // a classified LlmError when the currently committed key is denylisted.
     async *stream(streamOptions) {
       streamCalls.push(streamOptions)
-      if (streamOptions?.[TEST_MARKER]) {
+      if (streamOptions?.[TEST_MARKER] || streamOptions?.[MODEL_TEST_MARKER]) {
         const routeRef = PROVIDER_REFS.get(streamOptions.provider)
         const hit = routeRef ? await options.readKey?.(routeRef) : undefined
         // Test-only observation of the key committed when the probe ran.
@@ -90,6 +91,7 @@ async function harness(overrides = {}) {
     failKeys: overrides.failKeys,
     hang: overrides.hang === true,
     noModels: overrides.noModels === true,
+    catalogModels: overrides.catalogModels,
     readKey: async (refName) => (await app.credentials.resolve(refName))?.value,
   })
   const connection = mockConnection()
@@ -629,6 +631,202 @@ describe('dsh-multi-account', () => {
       assert.equal(missingAccount.body.code, 'NOT_FOUND')
       const missingProvider = await env.call('test-provider', { providerId: 'ghost' })
       assert.equal(missingProvider.status, 404)
+    })
+  })
+
+  describe('model tests', () => {
+    it('lists catalog models through the models route with no prior result', async () => {
+      const env = await harness()
+      home = env.home
+      const { status, body } = await env.call('models', { providerId: PROVIDER })
+      assert.equal(status, 200)
+      assert.equal(body.providerId, PROVIDER)
+      assert.deepEqual(body.models, [{ id: 'test-model', name: 'Test Model', lastTest: null }])
+    })
+
+    it('falls back to profile models when the adapter catalog is unavailable', async () => {
+      const env = await harness({
+        noModels: true,
+        providers: {
+          [PROVIDER]: { apiKeyEnv: REF, displayName: 'DeepSeek', models: [{ id: 'profile-a' }, { id: 'profile-b' }] },
+        },
+      })
+      home = env.home
+      const { body } = await env.call('models', { providerId: PROVIDER })
+      assert.deepEqual(body.models.map((m) => m.id), ['profile-a', 'profile-b'])
+    })
+
+    it('probes one model with the active account key and persists the result under modelTests', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const { status, body } = await env.call('test-model', { providerId: PROVIDER, model: 'test-model' })
+      assert.equal(status, 200)
+      assert.equal(body.model, 'test-model')
+      assert.equal(body.result.state, 'ok')
+      assert.equal(body.result.model, 'test-model')
+
+      const probe = env.streamCalls.find((call) => call[MODEL_TEST_MARKER] === true)
+      assert.ok(probe)
+      assert.equal(probe.model, 'test-model')
+      assert.equal(probe.maxTokens, 1)
+      assert.equal(probe.__committedKey, 'sk-aaa')
+      assert.equal(probe[TEST_MARKER], undefined)
+
+      const refreshed = await env.call('models', { providerId: PROVIDER })
+      assert.equal(refreshed.body.models[0].lastTest.state, 'ok')
+      // Results live in the separate modelTests map, never inside a provider section.
+      const stateText = await readFile(join(home, 'multi-account', 'state.json'), 'utf8')
+      const persisted = JSON.parse(stateText)
+      assert.ok(persisted.modelTests[PROVIDER]['test-model'])
+      assert.ok(!stateText.includes('sk-aaa'))
+      // The key stays committed — model tests do not swap-and-restore.
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('classifies a rejected key during a model probe as invalid', async () => {
+      const env = await harness({ failKeys: new Map([[PROVIDER, new Set(['sk-bbb'])]]) })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      const accountB = (await env.call('state')).body.providers[0].accounts.find((a) => a.label === 'B')
+      await env.call('switch', { providerId: PROVIDER, accountId: accountB.id })
+
+      const { status, body } = await env.call('test-model', { providerId: PROVIDER, model: 'test-model' })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'invalid')
+      assert.equal(body.result.code, 'AUTH')
+    })
+
+    it('tests every model of one provider in one batch', async () => {
+      const env = await harness({
+        catalogModels: new Map([[PROVIDER, [
+          { provider: PROVIDER, id: 'm-1', name: 'Model One' },
+          { provider: PROVIDER, id: 'm-2', name: 'Model Two' },
+        ]]]),
+      })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const { status, body } = await env.call('test-provider-models', { providerId: PROVIDER })
+      assert.equal(status, 200)
+      assert.deepEqual(body.results.map((r) => r.model), ['m-1', 'm-2'])
+      assert.ok(body.results.every((r) => r.state === 'ok'))
+      assert.deepEqual(body.models.map((m) => m.id), ['m-1', 'm-2'])
+      assert.ok(body.models.every((m) => m.lastTest?.state === 'ok'))
+      const probes = env.streamCalls.filter((call) => call[MODEL_TEST_MARKER] === true)
+      assert.deepEqual(probes.map((call) => call.model), ['m-1', 'm-2'])
+    })
+
+    it('tests every model of every configurable provider', async () => {
+      const env = await harness()
+      home = env.home
+      await env.app.credentials.set(REF, 'sk-deep')
+      await env.app.credentials.set(OPENROUTER_REF, 'sk-or')
+      const { status, body } = await env.call('test-all-models')
+      assert.equal(status, 200)
+      assert.equal(body.results.length, 2)
+      assert.deepEqual([...new Set(body.results.map((r) => r.providerId))].sort(), ['deepseek', 'openrouter'])
+      assert.ok(body.results.every((r) => r.state === 'ok' && r.model === 'test-model'))
+    })
+
+    it('never rotates the active account while testing models, even in round-robin mode', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      await env.call('mode', { providerId: PROVIDER, mode: 'round-robin' })
+      const before = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8')).providers[PROVIDER]
+
+      await env.call('test-model', { providerId: PROVIDER, model: 'test-model' })
+
+      const after = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8')).providers[PROVIDER]
+      assert.equal(after.activeAccountId, before.activeAccountId)
+      assert.equal(after.rrCursor, before.rrCursor)
+    })
+
+    it('works for providers without managed accounts using the key saved in Settings', async () => {
+      const env = await harness()
+      home = env.home
+      await env.app.credentials.set(REF, 'sk-manual')
+      const { status, body } = await env.call('test-model', { providerId: PROVIDER, model: 'test-model' })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'ok')
+      const persisted = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      // No managed provider section is created just because a model was tested.
+      assert.deepEqual(persisted.providers, {})
+      assert.ok(persisted.modelTests[PROVIDER]['test-model'])
+    })
+
+    it('reports MISSING_CREDENTIAL without a probe when the active account key is gone', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const persisted = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      const credentialRef = persisted.providers[PROVIDER].accounts[0].credentialRef
+      await env.app.credentials.unset(credentialRef)
+
+      const { status, body } = await env.call('test-model', { providerId: PROVIDER, model: 'test-model' })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'invalid')
+      assert.equal(body.result.code, 'MISSING_CREDENTIAL')
+      assert.equal(env.streamCalls.filter((call) => call[MODEL_TEST_MARKER] === true).length, 0)
+    })
+
+    it('validates input and reports NO_MODEL when nothing is discoverable', async () => {
+      const env = await harness({ noModels: true })
+      home = env.home
+      const badModel = await env.call('test-model', { providerId: PROVIDER, model: '' })
+      assert.equal(badModel.status, 400)
+      assert.equal(badModel.body.code, 'BAD_REQUEST')
+      const badProvider = await env.call('test-model', { providerId: '', model: 'x' })
+      assert.equal(badProvider.status, 400)
+      const nothing = await env.call('test-provider-models', { providerId: PROVIDER })
+      assert.equal(nothing.status, 409)
+      assert.equal(nothing.body.code, 'NO_MODEL')
+    })
+
+    it('serializes concurrent model probes through the shared provider lock', async () => {
+      const env = await harness({
+        catalogModels: new Map([[PROVIDER, [
+          { provider: PROVIDER, id: 'm-1', name: 'One' },
+          { provider: PROVIDER, id: 'm-2', name: 'Two' },
+        ]]]),
+      })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const [first, second] = await Promise.all([
+        env.call('test-model', { providerId: PROVIDER, model: 'm-1' }),
+        env.call('test-model', { providerId: PROVIDER, model: 'm-2' }),
+      ])
+      assert.equal(first.status, 200)
+      assert.equal(second.status, 200)
+      const probes = env.streamCalls.filter((call) => call[MODEL_TEST_MARKER] === true)
+      assert.deepEqual(probes.map((call) => call.model).sort(), ['m-1', 'm-2'])
+      assert.ok(probes.every((call) => call.__committedKey === 'sk-aaa'))
+    })
+
+    it('survives a restart with model test results intact and tolerates legacy documents', async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-ma-store-'))
+      try {
+        const first = new StateStore(directory)
+        await first.update((draft) => {
+          draft.modelTests[PROVIDER] = {
+            'm-1': { state: 'ok', code: null, message: null, at: 9, latencyMs: 3, model: 'm-1' },
+          }
+        })
+        const second = new StateStore(directory)
+        const snapshot = await second.snapshot()
+        assert.deepEqual(snapshot.modelTests[PROVIDER]['m-1'], {
+          state: 'ok', code: null, message: null, at: 9, latencyMs: 3, model: 'm-1',
+        })
+        // A document predating modelTests loads with an empty map.
+        const { writeFile } = await import('node:fs/promises')
+        await writeFile(join(directory, 'state.json'), JSON.stringify({ version: 1, providers: {} }))
+        const third = new StateStore(directory)
+        assert.deepEqual((await third.snapshot()).modelTests, {})
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
     })
   })
 })

@@ -97,6 +97,19 @@ window.__ModuleLoader__.load({
       testPassed: '测试通过 · {latency} ms',
       testFailed: '测试失败 · {code}',
       testAllEmpty: '暂无可测试的账号。',
+      modelsHeading: '模型',
+      loadingModels: '正在加载模型…',
+      noModels: '此服务商没有可测试的模型。',
+      modelColumn: '模型',
+      testModel: '测试',
+      testModelTooltip: '用当前生效账号的 Key 为此模型发起一次极简请求',
+      testProviderModels: '测试本服务商全部模型',
+      testAllModels: '测试所有服务商的全部模型',
+      modelTestSummaryOk: '{ok}/{total} 个模型测试通过',
+      modelTestSummaryMixed: '{ok}/{total} 个通过，{failed} 个失败',
+      noModelsToTest: '暂无可测试的模型。',
+      modelCount: '{count} 个模型',
+      modelCountOne: '1 个模型',
     }
 
     const en = {
@@ -173,6 +186,19 @@ window.__ModuleLoader__.load({
       testPassed: 'Passed · {latency} ms',
       testFailed: 'Failed · {code}',
       testAllEmpty: 'No accounts to test.',
+      modelsHeading: 'Models',
+      loadingModels: 'Loading models…',
+      noModels: 'This provider has no models available for testing.',
+      modelColumn: 'Model',
+      testModel: 'Test',
+      testModelTooltip: 'Verify this model with a minimal request using the currently active account key',
+      testProviderModels: 'Test all models of this provider',
+      testAllModels: 'Test all models of all providers',
+      modelTestSummaryOk: '{ok}/{total} models passed',
+      modelTestSummaryMixed: '{ok}/{total} passed, {failed} failed',
+      noModelsToTest: 'No models to test.',
+      modelCount: '{count} models',
+      modelCountOne: '1 model',
     }
 
     const css = `
@@ -219,6 +245,7 @@ window.__ModuleLoader__.load({
 .dshMaTestLine.isError{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-secondary))}
 .dshMaTestLine.isIdle{color:var(--dsw-alias-label-tertiary)}
 .dshMaBatchActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dshMaModelRow{grid-template-columns:minmax(0,1fr) auto}
 @keyframes dshMaSpin{to{transform:rotate(360deg)}}
 .dshMaSpin{animation:dshMaSpin 1s linear infinite}
 @media (prefers-reduced-motion: reduce){.dshMaEntryButton,.dshMaRow{transition:none}.dshMaSpin{animation:none}}
@@ -227,6 +254,7 @@ window.__ModuleLoader__.load({
 .dshMaListHead{display:none}
 .dshMaRow{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"identity actions" "status switch"}
 .dshMaIdentity{grid-area:identity}.dshMaActions{grid-area:actions}.dshMaStatusCell{grid-area:status}.dshMaSwitchCell{grid-area:switch;justify-content:flex-start}
+.dshMaModelRow{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"identity actions"}
 }
 `
 
@@ -298,8 +326,7 @@ window.__ModuleLoader__.load({
         error ? h('p', { className: 'dshMaError', role: 'alert' }, error) : null)
     }
 
-    function LastTestLine({ account, t }) {
-      const test = account.lastTest
+    function LastTestLine({ test, t }) {
       if (!test) {
         return h('span', { className: 'dshMaTestLine isIdle' }, t('testNever'))
       }
@@ -326,7 +353,7 @@ window.__ModuleLoader__.load({
             isActive ? h(Tag, { tone: 'solid' }, t('active')) : null,
             h('span', null, `${t('keyHintLabel')}: ${account.keyHint ?? t('noKeyStored')}`),
             account.enabled ? null : h('span', null, t('disabled'))),
-          h(LastTestLine, { account, t })),
+          h(LastTestLine, { test: account.lastTest, t })),
         h('div', { className: 'dshMaStatusCell' },
           h(StatusTag, { state: account.status?.state ?? 'ok', t })),
         h('div', { className: 'dshMaSwitchCell' },
@@ -363,6 +390,23 @@ window.__ModuleLoader__.load({
                 'aria-label': `${t('remove')}: ${account.label}`, onClick: () => setConfirming(true) }, t('remove'))))
     }
 
+    function ModelRow({ model, busy, testing, t, onTest }) {
+      return h('li', { className: 'dshMaRow dshMaModelRow' },
+        h('div', { className: 'dshMaIdentity' },
+          h('span', { className: 'dshMaName', title: model.id }, model.name || model.id),
+          h(LastTestLine, { test: model.lastTest, t })),
+        h('div', { className: 'dshMaActions' },
+          h(Tooltip, { label: t('testModelTooltip') },
+            h(Button, {
+              variant: 'outline', size: 'sm', disabled: busy,
+              'aria-label': `${t('testModel')}: ${model.name || model.id}`,
+              icon: testing
+                ? h(IconRefreshOutlineRegular, { size: 14, className: 'dshMaSpin' })
+                : h(IconPlayOutlineRegular, { size: 14 }),
+              onClick: () => onTest(model),
+            }, testing ? t('testing') : t('testModel')))))
+    }
+
     function AccountManagerModal({ entry, onClose, callApi, t }) {
       const [provider, setProvider] = React.useState(null)
       const [loading, setLoading] = React.useState(true)
@@ -371,6 +415,10 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null)
       // Account ids whose test request is currently in flight (row spinners).
       const [testingIds, setTestingIds] = React.useState(() => new Set())
+      // Lazy-loaded model catalog with per-model probe results.
+      const [modelData, setModelData] = React.useState(null)
+      const [modelsLoading, setModelsLoading] = React.useState(false)
+      const [modelTestingIds, setModelTestingIds] = React.useState(() => new Set())
 
       const refresh = React.useCallback(async () => {
         setLoading(true); setLoadError(false)
@@ -449,6 +497,66 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const summarizeModelResults = (results) => {
+        const total = Array.isArray(results) ? results.length : 0
+        if (total === 0) return { kind: 'error', text: t('noModelsToTest') }
+        const ok = results.filter((result) => result.state === 'ok').length
+        const failed = total - ok
+        if (failed === 0) return { kind: 'ok', text: t('modelTestSummaryOk', { ok, total }) }
+        return { kind: 'error', text: t('modelTestSummaryMixed', { ok, total, failed }) }
+      }
+
+      const loadModels = React.useCallback(async () => {
+        setModelsLoading(true)
+        try {
+          const body = await callApi('models', { providerId: entry.provider })
+          setModelData(body)
+        } catch {
+          setModelData({ models: [] })
+        } finally {
+          setModelsLoading(false)
+        }
+      }, [callApi, entry.provider])
+
+      React.useEffect(() => { void loadModels() }, [loadModels])
+
+      const runModelTest = async (scope, model) => {
+        if (busy) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
+        const ids = scope === 'model' ? [model.id] : (modelData?.models ?? []).map((item) => item.id)
+        if (scope !== 'all' && ids.length === 0) {
+          setNotice({ kind: 'error', text: t('noModelsToTest') }); return
+        }
+        setBusy(true)
+        setModelTestingIds(new Set(ids))
+        setNotice(null)
+        try {
+          if (scope === 'model') {
+            const body = await callApi('test-model', { providerId: entry.provider, model: model.id })
+            const result = body?.result
+            setModelData((current) => (current ? {
+              ...current,
+              models: current.models.map((item) => item.id === model.id ? { ...item, lastTest: result } : item),
+            } : current))
+            setNotice(result?.state === 'ok'
+              ? { kind: 'ok', text: t('testPassed', { latency: result.latencyMs ?? 0 }) }
+              : { kind: 'error', text: t('testFailed', { code: result?.code ?? t('statusUnknown') }) })
+          } else if (scope === 'provider') {
+            const body = await callApi('test-provider-models', { providerId: entry.provider })
+            setModelData((current) => ({ ...(current ?? { providerId: entry.provider }), models: body?.models ?? [] }))
+            setNotice(summarizeModelResults(body?.results))
+          } else {
+            const body = await callApi('test-all-models')
+            setNotice(summarizeModelResults(body?.results))
+            await loadModels()
+          }
+        } catch (error) {
+          setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
+        } finally {
+          setBusy(false)
+          setModelTestingIds(new Set())
+        }
+      }
+
       const guardedClose = () => { if (!busy) onClose() }
       const modeOptions = [
         { value: 'manual', label: t('modeManual') },
@@ -523,6 +631,35 @@ window.__ModuleLoader__.load({
                             onClearStatus: (target) => run(() => callApi('clear-status', { providerId: entry.provider, accountId: target.id })),
                           })))
                       : h('p', { className: 'dshMaEmpty' }, t('empty'))),
+                  h('section', { 'aria-label': t('modelsHeading') },
+                    h('div', { className: 'dshMaBatchActions' },
+                      h('p', { className: 'dshMaModeTitle', style: { margin: 0 } },
+                        `${t('modelsHeading')} · ${modelData?.models?.length
+                          ? (modelData.models.length === 1 ? t('modelCountOne') : t('modelCount', { count: modelData.models.length }))
+                          : t('none')}`),
+                      h(Tooltip, { label: t('testProviderModels') },
+                        h(Button, {
+                          variant: 'outline', size: 'sm',
+                          disabled: busy || !modelData?.models?.length,
+                          icon: h(IconPlayOutlineRegular, { size: 14 }),
+                          onClick: () => runModelTest('provider'),
+                        }, t('testProviderModels'))),
+                      h(Tooltip, { label: t('testAllModels') },
+                        h(Button, {
+                          variant: 'ghost', size: 'sm', disabled: busy,
+                          icon: h(IconChecklistOutlineRegular, { size: 14 }),
+                          onClick: () => runModelTest('all'),
+                        }, t('testAllModels')))),
+                    modelsLoading
+                      ? h('p', { className: 'dshMaNotice', role: 'status' }, t('loadingModels'))
+                      : modelData?.models?.length
+                        ? h('ul', { className: 'dshMaList', style: { listStyle: 'none', margin: 0, padding: 0 } },
+                            modelData.models.map((model) => h(ModelRow, {
+                              key: model.id, model, busy,
+                              testing: modelTestingIds.has(model.id), t,
+                              onTest: (target) => runModelTest('model', target),
+                            })))
+                        : h('p', { className: 'dshMaEmpty' }, t('noModels'))),
                   h(AddAccountForm, {
                     busy, t,
                     canImport: provider?.refConfigured === true,

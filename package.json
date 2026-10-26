@@ -1,6 +1,6 @@
 {
   "name": "dsh-multi-account",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Multi-account support for DSH Desktop model providers: manage several API keys per provider and switch manually, on errors/quota exhaustion, or round robin.",
   "type": "module",
   "main": "./index.js",
