@@ -13,18 +13,21 @@ import { StateStore } from './lib/state-store.js'
 import { ProviderDirectory } from './lib/provider-directory.js'
 import { AccountManager, mountSwitcher } from './lib/account-switcher.js'
 import { registerRoutes } from './lib/api-routes.js'
-import { PLUGIN_NAME } from './lib/protocol.js'
+import { LIMITS, PLUGIN_NAME } from './lib/protocol.js'
 
 export const name = PLUGIN_NAME
 export const inject = ['connection', 'credentials', 'llm']
 export const Config = Schema.object({
   root: Schema.string().required(),
+  testTimeoutMs: Schema.natural().default(LIMITS.TEST_TIMEOUT_MS),
 })
 
 export function apply(ctx, config) {
   const store = new StateStore(config.root)
   const directory = new ProviderDirectory(ctx)
-  const manager = new AccountManager(ctx, store, directory)
+  const manager = new AccountManager(ctx, store, directory, {
+    testTimeoutMs: config.testTimeoutMs,
+  })
 
   // Surface a corrupt or unreadable state document without blocking Harness.
   store.ready.then(() => {

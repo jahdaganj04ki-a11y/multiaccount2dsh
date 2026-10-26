@@ -92,6 +92,32 @@ Beim ersten Account wird dessen Key automatisch zum aktiven Key des
 Anbieters. Jede Anfrage liest den aktiven Key erst zur Laufzeit, ein
 Neustart ist nach Account-Änderungen nicht nötig.
 
+### Accounts testen
+
+Das Account-Fenster bietet drei Test-Ebenen. Jeder Test schickt eine
+minimale Ein-Token-Anfrage über den echten Provider-Adapter, wertet die
+Antwort aus und zeigt das Ergebnis (Status, Fehlercode, Latenz) direkt
+beim Account an:
+
+- **Einzelner Account** — Test-Button (▶) in der Zeile des Accounts.
+- **Alle Accounts eines Providers** — „Test all accounts of this
+  provider“ in der Account-Überschrift; die Accounts werden nacheinander
+  geprüft.
+- **Alle Accounts aller Provider** — „Test all accounts of all
+  providers“; läuft durch sämtliche verwalteten Anbieter (max. 100
+  Accounts pro Lauf).
+
+Dabei wird der zu prüfende Key nur vorübergehend in die
+Credential-Variable des Providers geschrieben und nach dem Lauf
+vollständig wiederhergestellt — der aktive Account, Round-Robin-Stand
+und der laufende Betrieb werden nicht verändert. Deaktivierte Accounts
+werden ebenfalls getestet (die Frage ist ja: *würde* dieser Key
+funktionieren?). Schlägt ein Test fehl, wird der Fehler klassifiziert
+(z. B. `AUTH` = ungültiger Key, `QUOTA` = Kontingent erschöpft,
+`RATE_LIMIT` = gedrosselt, `TIMEOUT` = keine Antwort innerhalb von
+20 s). Ein Timeout-Limit ist über die Plugin-Config
+(`testTimeoutMs`, Standard 20000 ms) anpassbar.
+
 ### Verhalten der Umschaltmodi
 
 | Modus | Verhalten |
@@ -155,6 +181,27 @@ build does not list local-tarball support.
 3. Import the currently saved key and/or add more accounts, then choose
    a switching mode and activate accounts as needed.
 
+### Testing accounts
+
+The account window offers three test scopes. Each test sends a minimal
+one-token request through the provider's real adapter and records the
+outcome (health state, error code, latency) on the account:
+
+- **One account** — the ▸ **Test** button on each account row.
+- **Every account of one provider** — *Test all accounts of this
+  provider* next to the accounts heading, run sequentially.
+- **Every account of every provider** — *Test all accounts of all
+  providers*, iterating all managed providers (capped at 100 accounts
+  per run).
+
+The key under test is committed to the provider's credential variable
+only for the duration of the probe and restored afterwards, so the
+active account, round-robin cursor and live traffic are unaffected.
+Disabled accounts are tested too. Failures are classified (`AUTH`,
+`INVALID_CREDENTIAL`, `QUOTA`, `ACCOUNT_QUOTA`, `RATE_LIMIT`,
+`TIMEOUT`, …); the wall-clock budget is configurable through the
+plugin config (`testTimeoutMs`, default 20000 ms).
+
 ### Data locations
 
 - State: `<DSH_HOME>/multi-account/state.json` (mode `0600`),
@@ -170,6 +217,7 @@ build does not list local-tarball support.
 | --- | --- |
 | UI entry | Keyed client slot `settings.models.provider-card` (one contribution per settings namespace, rendered per provider row), opening a host-`Modal` built from `dsh-client-ui-primitives`. |
 | Client/server transport | Plugin-owned routes under `/api/multi-account.*`, registered with `ctx.connection.fetch.register`; buffered, bounded JSON, no secrets on read responses. |
+| Account tests | `test-account` / `test-provider` / `test-all` routes temporarily commit one key, invoke `ctx.llm.stream` with a one-token probe (marked internally so the plugin's own listener skips rotation), classify the result and always restore the previous credential; per-provider locking serializes the swaps. |
 | Secret storage | `ctx.credentials.set/unset/resolve`; each account owns a generated credential ref, the active account's value is committed to the provider's own ref (the exact value `llm-pi-ai` resolves per request). |
 | Round robin / enforcement | Prepended global `llm/stream` waterfall listener; rotates the cursor and commits the key before the adapter resolves the credential. |
 | Failover | Prepended global `agent/request-error` waterfall listener; classifies `AUTH`, `INVALID_CREDENTIAL`, `QUOTA`, `ACCOUNT_QUOTA`, `MISSING_CREDENTIAL` and `RATE_LIMIT`, marks the account, rotates and returns `{ kind: 'retry' }` — the same contract as the official `dsh-llm-retry` plugin. A per-step budget prevents retry loops. |

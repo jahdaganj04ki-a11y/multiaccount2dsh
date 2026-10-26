@@ -7,15 +7,49 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalCredentialProvider } from '@deepseek-ai/dsh-credentials-local'
 import * as plugin from '../index.js'
 import { StateStore } from '../lib/state-store.js'
+import { TEST_MARKER } from '../lib/protocol.js'
 
 const PROVIDER = 'deepseek'
 const REF = 'DEEPSEEK_API_KEY'
+const OPENROUTER_REF = 'OPENROUTER_API_KEY'
 
-function mockLlm(entries) {
+/** Route ref each provider's key gets committed to during a test. */
+const PROVIDER_REFS = new Map([[PROVIDER, REF], ['openrouter', OPENROUTER_REF]])
+
+function mockLlm(entries, options = {}) {
+  const streamCalls = []
   return {
+    streamCalls,
     listConfigurableProviders: async () => entries,
     registerAdapter: () => ({ replace() {} }),
     registerConfigurableProviders: () => ({ replace() {} }),
+    listModels: options.noModels
+      ? async () => { throw Object.assign(new Error('catalog unavailable'), { code: 'NO_CATALOG' }) }
+      : async (providerId) => [{ provider: providerId, id: 'test-model', name: 'Test Model' }],
+    // Mimics the real llm service: returns an async iterable and rejects with
+    // a classified LlmError when the currently committed key is denylisted.
+    async *stream(streamOptions) {
+      streamCalls.push(streamOptions)
+      if (streamOptions?.[TEST_MARKER]) {
+        const routeRef = PROVIDER_REFS.get(streamOptions.provider)
+        const hit = routeRef ? await options.readKey?.(routeRef) : undefined
+        // Test-only observation of the key committed when the probe ran.
+        streamOptions.__committedKey = hit
+        const denylist = options.failKeys?.get(streamOptions.provider)
+        if (denylist?.has(hit)) {
+          throw Object.assign(new Error(`key ${hit} rejected by ${streamOptions.provider}`), { code: 'AUTH' })
+        }
+        if (options.hang) {
+          await new Promise((resolve, reject) => {
+            streamOptions.signal?.addEventListener('abort', () => {
+              reject(Object.assign(new Error('aborted'), { code: 'ABORTED' }))
+            }, { once: true })
+          })
+        }
+      }
+      yield { type: 'text', text: 'OK' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
   }
 }
 
@@ -52,7 +86,12 @@ async function harness(overrides = {}) {
   const llm = mockLlm([
     { provider: PROVIDER, displayName: 'DeepSeek', settingsNs: 'llm-pi-ai', settingsPath: ['providers', PROVIDER] },
     { provider: 'openrouter', displayName: 'OpenRouter', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openrouter'] },
-  ])
+  ], {
+    failKeys: overrides.failKeys,
+    hang: overrides.hang === true,
+    noModels: overrides.noModels === true,
+    readKey: async (refName) => (await app.credentials.resolve(refName))?.value,
+  })
   const connection = mockConnection()
   app.provide('llm', llm)
   app.provide('connection', connection)
@@ -64,7 +103,10 @@ async function harness(overrides = {}) {
     dshHome: home,
     watch: false,
   })
-  await app.plugin(plugin, { root: join(home, 'multi-account') })
+  await app.plugin(plugin, {
+    root: join(home, 'multi-account'),
+    ...overrides.testTimeoutMs === undefined ? {} : { testTimeoutMs: overrides.testTimeoutMs },
+  })
 
   async function call(suffix, body) {
     const path = `/api/multi-account.${suffix}`
@@ -110,7 +152,7 @@ async function harness(overrides = {}) {
     return { result, innerCalled }
   }
 
-  return { app, home, call, refValue, stream, requestError }
+  return { app, home, call, refValue, stream, requestError, streamCalls: llm.streamCalls }
 }
 
 describe('dsh-multi-account', () => {
@@ -364,6 +406,18 @@ describe('dsh-multi-account', () => {
       assert.equal(restored.mode, 'round-robin')
       assert.equal(restored.accounts[0].credentialRef, 'DSH_MA_DEEPSEEK_X')
       assert.equal(restored.accounts[0].label, 'Persisted')
+      // Documents written before lastTest existed load with a null result.
+      assert.equal(restored.accounts[0].lastTest, null)
+
+      await first.update((draft) => {
+        draft.providers[PROVIDER].accounts[0].lastTest = {
+          state: 'ok', code: null, message: null, at: 42, latencyMs: 7, model: 'm-1',
+        }
+      })
+      const third = new StateStore(directory)
+      assert.deepEqual((await third.provider(PROVIDER)).accounts[0].lastTest, {
+        state: 'ok', code: null, message: null, at: 42, latencyMs: 7, model: 'm-1',
+      })
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -403,5 +457,178 @@ describe('dsh-multi-account', () => {
     assert.equal(added.status, 200)
     assert.equal(added.body.provider.accounts.length, 1)
     assert.equal(await env.refValue(), 'sk-explicit')
+  })
+
+  describe('account tests', () => {
+    it('runs a minimal marked probe for one account and records the result', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      const account = (await env.call('state')).body.providers[0].accounts[0]
+
+      const { status, body } = await env.call('test-account', { providerId: PROVIDER, accountId: account.id })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'ok')
+      assert.equal(body.result.code, null)
+      assert.equal(body.result.model, 'test-model')
+      assert.equal(typeof body.result.latencyMs, 'number')
+      assert.ok(body.result.latencyMs >= 0)
+
+      // The probe went through the llm service as a cheap one-token request
+      // and carried the internal marker so our own listener skipped rotation.
+      const probe = env.streamCalls.find((call) => call[TEST_MARKER] === true)
+      assert.ok(probe)
+      assert.equal(probe.provider, PROVIDER)
+      assert.equal(probe.model, 'test-model')
+      assert.equal(probe.maxTokens, 1)
+      assert.equal(probe.__committedKey, 'sk-aaa')
+
+      // Result is persisted and exposed through the normal state view.
+      const refreshed = (await env.call('state')).body.providers[0].accounts[0]
+      assert.equal(refreshed.lastTest.state, 'ok')
+      assert.equal(refreshed.lastTest.model, 'test-model')
+      // The temporary swap is fully transparent afterwards.
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('classifies a rejected key as invalid and restores the previous ref', async () => {
+      const env = await harness({ failKeys: new Map([[PROVIDER, new Set(['sk-bbb'])]]) })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      const accountB = (await env.call('state')).body.providers[0].accounts.find((a) => a.label === 'B')
+
+      const { status, body } = await env.call('test-account', { providerId: PROVIDER, accountId: accountB.id })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'invalid')
+      assert.equal(body.result.code, 'AUTH')
+      assert.match(body.result.message, /rejected/)
+      // Active account, its key and the modal view stay untouched.
+      assert.equal(await env.refValue(), 'sk-aaa')
+      assert.equal(body.provider.activeAccountId, (await env.call('state')).body.providers[0].activeAccountId)
+      assert.equal(body.provider.accounts.find((a) => a.id === accountB.id).lastTest.state, 'invalid')
+    })
+
+    it('tests every account of one provider in one batch call', async () => {
+      const env = await harness({ failKeys: new Map([[PROVIDER, new Set(['sk-bbb'])]]) })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+
+      const { status, body } = await env.call('test-provider', { providerId: PROVIDER })
+      assert.equal(status, 200)
+      assert.equal(body.results.length, 2)
+      const byLabel = Object.fromEntries(body.provider.accounts.map((account) => [account.label, account.lastTest.state]))
+      assert.deepEqual(byLabel, { A: 'ok', B: 'invalid' })
+      // Each probe observed its own account's key on the route ref.
+      const probes = env.streamCalls.filter((call) => call[TEST_MARKER] === true)
+      assert.deepEqual(probes.map((call) => call.__committedKey), ['sk-aaa', 'sk-bbb'])
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('tests all accounts of all providers and restores every route ref', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-bbb' })
+      await env.call('add', { providerId: 'openrouter', ref: OPENROUTER_REF, apiKey: 'sk-or-1' })
+
+      const { status, body } = await env.call('test-all')
+      assert.equal(status, 200)
+      assert.equal(body.results.length, 3)
+      assert.deepEqual([...new Set(body.results.map((r) => r.providerId))].sort(), ['deepseek', 'openrouter'])
+      assert.ok(body.results.every((r) => r.state === 'ok'))
+      assert.ok(body.providers.find((p) => p.providerId === 'openrouter').accounts[0].lastTest.state === 'ok')
+      assert.equal(await env.refValue(), 'sk-aaa')
+      assert.equal(await env.app.credentials.resolve(OPENROUTER_REF).then((h) => h?.value), 'sk-or-1')
+    })
+
+    it('never rotates the active account while testing, even in round-robin mode', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      await env.call('mode', { providerId: PROVIDER, mode: 'round-robin' })
+      const before = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8')).providers[PROVIDER]
+      const accountB = (await env.call('state')).body.providers[0].accounts.find((a) => a.label === 'B')
+
+      await env.call('test-account', { providerId: PROVIDER, accountId: accountB.id })
+
+      const after = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8')).providers[PROVIDER]
+      assert.equal(after.activeAccountId, before.activeAccountId)
+      assert.equal(after.rrCursor, before.rrCursor)
+      assert.ok(env.streamCalls.some((call) => call[TEST_MARKER] === true && call.__committedKey === 'sk-bbb'))
+    })
+
+    it('reports TIMEOUT when the probe exceeds its budget', async () => {
+      const env = await harness({ hang: true, testTimeoutMs: 40 })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const account = (await env.call('state')).body.providers[0].accounts[0]
+      const { status, body } = await env.call('test-account', { providerId: PROVIDER, accountId: account.id })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'error')
+      assert.equal(body.result.code, 'TIMEOUT')
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('reports NO_MODEL when neither catalog nor profile offers a model', async () => {
+      const env = await harness({ noModels: true })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const account = (await env.call('state')).body.providers[0].accounts[0]
+      const { status, body } = await env.call('test-account', { providerId: PROVIDER, accountId: account.id })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'error')
+      assert.equal(body.result.code, 'NO_MODEL')
+      assert.equal(env.streamCalls.filter((call) => call[TEST_MARKER] === true).length, 0)
+    })
+
+    it('serializes concurrent tests on one provider so each sees its own key', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      const [a, b] = (await env.call('state')).body.providers[0].accounts
+
+      const [first, second] = await Promise.all([
+        env.call('test-account', { providerId: PROVIDER, accountId: a.id }),
+        env.call('test-account', { providerId: PROVIDER, accountId: b.id }),
+      ])
+      assert.equal(first.status, 200)
+      assert.equal(second.status, 200)
+      const keys = env.streamCalls
+        .filter((call) => call[TEST_MARKER] === true)
+        .map((call) => call.__committedKey)
+        .sort()
+      assert.deepEqual(keys, ['sk-aaa', 'sk-bbb'])
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('flags an account whose stored key disappeared without calling the provider', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const persisted = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      const credentialRef = persisted.providers[PROVIDER].accounts[0].credentialRef
+      const accountId = persisted.providers[PROVIDER].accounts[0].id
+      await env.app.credentials.unset(credentialRef)
+
+      const { status, body } = await env.call('test-account', { providerId: PROVIDER, accountId })
+      assert.equal(status, 200)
+      assert.equal(body.result.state, 'invalid')
+      assert.equal(body.result.code, 'MISSING_CREDENTIAL')
+      assert.equal(env.streamCalls.filter((call) => call[TEST_MARKER] === true).length, 0)
+    })
+
+    it('returns 404 for unknown accounts or unmanaged providers', async () => {
+      const env = await harness()
+      home = env.home
+      const missingAccount = await env.call('test-account', { providerId: PROVIDER, accountId: 'acct_nope' })
+      assert.equal(missingAccount.status, 404)
+      assert.equal(missingAccount.body.code, 'NOT_FOUND')
+      const missingProvider = await env.call('test-provider', { providerId: 'ghost' })
+      assert.equal(missingProvider.status, 404)
+    })
   })
 })

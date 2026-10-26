@@ -26,6 +26,8 @@ function stubPrimitives() {
     SegmentedControl: make('SegmentedControl'), Tag: make('Tag'), Tooltip: make('Tooltip'),
     IconUsersOutlineRegular: make('IconUsers'), IconPlusOutlineRegular: make('IconPlus'),
     IconRefreshOutlineRegular: make('IconRefresh'),
+    IconPlayOutlineRegular: make('IconPlay'), IconChecklistOutlineRegular: make('IconChecklist'),
+    IconCheckCircleOutlineRegular: make('IconCheckCircle'), IconWarningOutlineRegular: make('IconWarning'),
   }
 }
 

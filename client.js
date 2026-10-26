@@ -15,6 +15,8 @@ window.__ModuleLoader__.load({
     const {
       Modal, Button, Input, Switch, SegmentedControl, Tag, Tooltip,
       IconUsersOutlineRegular, IconPlusOutlineRegular, IconRefreshOutlineRegular,
+      IconPlayOutlineRegular, IconChecklistOutlineRegular,
+      IconCheckCircleOutlineRegular, IconWarningOutlineRegular,
     } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const NS = 'dsh.multiAccount'
@@ -84,6 +86,17 @@ window.__ModuleLoader__.load({
       accountCount: '{count} 个账号',
       accountCountOne: '1 个账号',
       none: '无',
+      test: '测试',
+      testTooltip: '用此账号的 Key 发起一次极简请求来验证',
+      testProvider: '测试本服务商全部账号',
+      testAllProviders: '测试所有服务商的全部账号',
+      testing: '测试中…',
+      testSummaryOk: '{ok}/{total} 个账号测试通过',
+      testSummaryMixed: '{ok}/{total} 个通过，{failed} 个失败',
+      testNever: '尚未测试',
+      testPassed: '测试通过 · {latency} ms',
+      testFailed: '测试失败 · {code}',
+      testAllEmpty: '暂无可测试的账号。',
     }
 
     const en = {
@@ -149,6 +162,17 @@ window.__ModuleLoader__.load({
       accountCount: '{count} accounts',
       accountCountOne: '1 account',
       none: 'None',
+      test: 'Test',
+      testTooltip: 'Verify this key with a minimal one-token request',
+      testProvider: 'Test all accounts of this provider',
+      testAllProviders: 'Test all accounts of all providers',
+      testing: 'Testing…',
+      testSummaryOk: '{ok}/{total} accounts passed',
+      testSummaryMixed: '{ok}/{total} passed, {failed} failed',
+      testNever: 'Not tested yet',
+      testPassed: 'Passed · {latency} ms',
+      testFailed: 'Failed · {code}',
+      testAllEmpty: 'No accounts to test.',
     }
 
     const css = `
@@ -189,7 +213,15 @@ window.__ModuleLoader__.load({
 .dshMaEmpty{font-size:12px;color:var(--dsw-alias-label-tertiary);border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;padding:14px;margin:0}
 .dshMaLive{min-height:18px;font-size:12px;margin:0}
 .dshMaConfirm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-@media (prefers-reduced-motion: reduce){.dshMaEntryButton,.dshMaRow{transition:none}}
+.dshMaTestLine{display:inline-flex;align-items:center;gap:4px;font-size:11px}
+.dshMaTestLine.isOk{color:var(--dsw-alias-state-success-label,var(--dsw-alias-label-secondary))}
+.dshMaTestLine.isBad{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-label-secondary))}
+.dshMaTestLine.isError{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-secondary))}
+.dshMaTestLine.isIdle{color:var(--dsw-alias-label-tertiary)}
+.dshMaBatchActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+@keyframes dshMaSpin{to{transform:rotate(360deg)}}
+.dshMaSpin{animation:dshMaSpin 1s linear infinite}
+@media (prefers-reduced-motion: reduce){.dshMaEntryButton,.dshMaRow{transition:none}.dshMaSpin{animation:none}}
 @media (width<=620px){
 .dshMaFieldRow{grid-template-columns:1fr}
 .dshMaListHead{display:none}
@@ -266,7 +298,25 @@ window.__ModuleLoader__.load({
         error ? h('p', { className: 'dshMaError', role: 'alert' }, error) : null)
     }
 
-    function AccountRow({ account, mode, busy, t, onSwitch, onToggle, onRemove, onClearStatus }) {
+    function LastTestLine({ account, t }) {
+      const test = account.lastTest
+      if (!test) {
+        return h('span', { className: 'dshMaTestLine isIdle' }, t('testNever'))
+      }
+      const ok = test.state === 'ok'
+      const toneClass = ok ? 'isOk' : (test.state === 'error' ? 'isError' : 'isBad')
+      const label = ok
+        ? t('testPassed', { latency: test.latencyMs ?? 0 })
+        : t('testFailed', { code: test.code ?? t('statusUnknown') })
+      return h('span', {
+        className: `dshMaTestLine ${toneClass}`,
+        title: test.message ? `${label} — ${test.message}` : label,
+      },
+        h(ok ? IconCheckCircleOutlineRegular : IconWarningOutlineRegular, { size: 12 }),
+        label)
+    }
+
+    function AccountRow({ account, mode, busy, testing, t, onSwitch, onToggle, onRemove, onClearStatus, onTest }) {
       const [confirming, setConfirming] = React.useState(false)
       const isActive = account.active === true
       return h('li', { className: `dshMaRow${isActive ? ' isActive' : ''}` },
@@ -275,7 +325,8 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dshMaMeta' },
             isActive ? h(Tag, { tone: 'solid' }, t('active')) : null,
             h('span', null, `${t('keyHintLabel')}: ${account.keyHint ?? t('noKeyStored')}`),
-            account.enabled ? null : h('span', null, t('disabled')))),
+            account.enabled ? null : h('span', null, t('disabled'))),
+          h(LastTestLine, { account, t })),
         h('div', { className: 'dshMaStatusCell' },
           h(StatusTag, { state: account.status?.state ?? 'ok', t })),
         h('div', { className: 'dshMaSwitchCell' },
@@ -287,6 +338,15 @@ window.__ModuleLoader__.load({
             onChange: (checked) => onToggle(account, checked),
           })),
         h('div', { className: 'dshMaActions' },
+          h(Tooltip, { label: t('testTooltip') },
+            h(Button, {
+              variant: 'outline', size: 'sm', disabled: busy,
+              'aria-label': `${t('test')}: ${account.label}`,
+              icon: testing
+                ? h(IconRefreshOutlineRegular, { size: 14, className: 'dshMaSpin' })
+                : h(IconPlayOutlineRegular, { size: 14 }),
+              onClick: () => onTest(account),
+            }, testing ? t('testing') : t('test'))),
           account.status?.state && account.status.state !== 'ok'
             ? h(Button, { variant: 'ghost', size: 'sm', disabled: busy, onClick: () => onClearStatus(account) }, t('clearStatus'))
             : null,
@@ -309,6 +369,8 @@ window.__ModuleLoader__.load({
       const [loadError, setLoadError] = React.useState(false)
       const [busy, setBusy] = React.useState(false)
       const [notice, setNotice] = React.useState(null)
+      // Account ids whose test request is currently in flight (row spinners).
+      const [testingIds, setTestingIds] = React.useState(() => new Set())
 
       const refresh = React.useCallback(async () => {
         setLoading(true); setLoadError(false)
@@ -336,6 +398,54 @@ window.__ModuleLoader__.load({
           setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
         } finally {
           setBusy(false)
+        }
+      }
+
+      const summarizeResults = (results) => {
+        const total = Array.isArray(results) ? results.length : 0
+        if (total === 0) return { kind: 'error', text: t('testAllEmpty') }
+        const ok = results.filter((result) => result.state === 'ok').length
+        const failed = total - ok
+        if (failed === 0) return { kind: 'ok', text: t('testSummaryOk', { ok, total }) }
+        return { kind: 'error', text: t('testSummaryMixed', { ok, total, failed }) }
+      }
+
+      const runTest = async (scope, account) => {
+        if (busy) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
+        const ids = scope === 'account'
+          ? [account.id]
+          : (provider?.accounts ?? []).map((candidate) => candidate.id)
+        // The global batch may still have work on other providers even when
+        // the currently open one has no accounts.
+        if (scope !== 'all' && ids.length === 0) {
+          setNotice({ kind: 'error', text: t('testAllEmpty') }); return
+        }
+        setBusy(true)
+        setTestingIds(new Set(ids))
+        setNotice(null)
+        try {
+          if (scope === 'account') {
+            const body = await callApi('test-account', { providerId: entry.provider, accountId: account.id })
+            if (body?.provider) setProvider(body.provider)
+            const result = body?.result
+            setNotice(result?.state === 'ok'
+              ? { kind: 'ok', text: t('testPassed', { latency: result.latencyMs ?? 0 }) }
+              : { kind: 'error', text: t('testFailed', { code: result?.code ?? t('statusUnknown') }) })
+          } else if (scope === 'provider') {
+            const body = await callApi('test-provider', { providerId: entry.provider })
+            if (body?.provider) setProvider(body.provider)
+            setNotice(summarizeResults(body?.results))
+          } else {
+            const body = await callApi('test-all')
+            const current = body?.providers?.find((candidate) => candidate.providerId === entry.provider)
+            if (current) setProvider(current)
+            setNotice(summarizeResults(body?.results))
+          }
+        } catch (error) {
+          setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
+        } finally {
+          setBusy(false)
+          setTestingIds(new Set())
         }
       }
 
@@ -381,8 +491,21 @@ window.__ModuleLoader__.load({
                     }),
                     h('p', { className: 'dshMaModeHint' }, modeHint[provider?.mode ?? 'manual'])),
                   h('section', { 'aria-label': t('accountsHeading') },
-                    h('p', { className: 'dshMaModeTitle' },
-                      `${t('accountsHeading')} · ${provider?.accounts?.length ? t('accountCount', { count: provider.accounts.length }) : t('none')}`),
+                    h('div', { className: 'dshMaBatchActions' },
+                      h('p', { className: 'dshMaModeTitle', style: { margin: 0 } },
+                        `${t('accountsHeading')} · ${provider?.accounts?.length ? t('accountCount', { count: provider.accounts.length }) : t('none')}`),
+                      h(Tooltip, { label: t('testProvider') },
+                        h(Button, {
+                          variant: 'outline', size: 'sm', disabled: busy || !provider?.accounts?.length,
+                          icon: h(IconPlayOutlineRegular, { size: 14 }),
+                          onClick: () => runTest('provider'),
+                        }, t('testProvider'))),
+                      h(Tooltip, { label: t('testAllProviders') },
+                        h(Button, {
+                          variant: 'ghost', size: 'sm', disabled: busy,
+                          icon: h(IconChecklistOutlineRegular, { size: 14 }),
+                          onClick: () => runTest('all'),
+                        }, t('testAllProviders')))),
                     provider?.accounts?.length
                       ? h('ul', { className: 'dshMaList', style: { listStyle: 'none', margin: 0, padding: 0 } },
                           h('li', { className: 'dshMaListHead', 'aria-hidden': true },
@@ -391,7 +514,9 @@ window.__ModuleLoader__.load({
                             h('span', null, t('columnEnabled')),
                             h('span', null, t('columnActions'))),
                           provider.accounts.map((account) => h(AccountRow, {
-                            key: account.id, account, mode: provider.mode, busy, t,
+                            key: account.id, account, mode: provider.mode, busy,
+                            testing: testingIds.has(account.id), t,
+                            onTest: (target) => runTest('account', target),
                             onSwitch: (target) => run(() => callApi('switch', { providerId: entry.provider, accountId: target.id })),
                             onToggle: (target, enabled) => run(() => callApi('toggle', { providerId: entry.provider, accountId: target.id, enabled })),
                             onRemove: (target) => run(() => callApi('remove', { providerId: entry.provider, accountId: target.id })),
