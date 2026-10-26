@@ -28,6 +28,7 @@ function stubPrimitives() {
     IconRefreshOutlineRegular: make('IconRefresh'),
     IconPlayOutlineRegular: make('IconPlay'), IconChecklistOutlineRegular: make('IconChecklist'),
     IconCheckCircleOutlineRegular: make('IconCheckCircle'), IconWarningOutlineRegular: make('IconWarning'),
+    IconStopFillRegular: make('IconStop'), IconTrashOutlineRegular: make('IconTrash'),
   }
 }
 

@@ -108,6 +108,7 @@ async function harness(overrides = {}) {
   await app.plugin(plugin, {
     root: join(home, 'multi-account'),
     ...overrides.testTimeoutMs === undefined ? {} : { testTimeoutMs: overrides.testTimeoutMs },
+    ...overrides.cooldownMs === undefined ? {} : { cooldownMs: overrides.cooldownMs },
   })
 
   async function call(suffix, body) {
@@ -122,6 +123,41 @@ async function harness(overrides = {}) {
     const response = await route.fetch(request)
     const text = await response.text()
     return { status: response.status, body: text ? JSON.parse(text) : null }
+  }
+
+  /** Start a batch job and poll until it reaches a terminal state. */
+  async function runJob(scope, extra = {}) {
+    const started = await call('test-start', { scope, ...extra })
+    assert.equal(started.status, 200)
+    assert.equal(started.body.status, 'running')
+    const jobId = started.body.id
+    let body = started.body
+    let polls = 0
+    while (body.status === 'running') {
+      // Yield a macrotask between polls: the in-memory fetch doubles resolve
+      // purely on microtasks, and a tight loop would otherwise starve the
+      // credential service's real file-I/O callbacks. A browser client polls
+      // over real HTTP and never hits this.
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const progress = await call('test-progress', { jobId })
+      assert.equal(progress.status, 200)
+      body = progress.body
+      polls += 1
+      if (polls > 200) throw new Error('job polling exceeded 200 iterations')
+    }
+    return body
+  }
+
+  /** Poll an already-started job (e.g. after an explicit abort) to its terminal state. */
+  async function runJobLoopUntilTerminal(jobId) {
+    let body
+    for (let polls = 0; polls < 200; polls += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const progress = await call('test-progress', { jobId })
+      body = progress.body
+      if (body.status !== 'running') return body
+    }
+    throw new Error('job never reached a terminal state')
   }
 
   async function refValue(refName = REF) {
@@ -154,7 +190,7 @@ async function harness(overrides = {}) {
     return { result, innerCalled }
   }
 
-  return { app, home, call, refValue, stream, requestError, streamCalls: llm.streamCalls }
+  return { app, home, call, runJob, runJobLoopUntilTerminal, refValue, stream, requestError, streamCalls: llm.streamCalls }
 }
 
 describe('dsh-multi-account', () => {
@@ -511,16 +547,20 @@ describe('dsh-multi-account', () => {
       assert.equal(body.provider.accounts.find((a) => a.id === accountB.id).lastTest.state, 'invalid')
     })
 
-    it('tests every account of one provider in one batch call', async () => {
+    it('tests every account of one provider as a background job', async () => {
       const env = await harness({ failKeys: new Map([[PROVIDER, new Set(['sk-bbb'])]]) })
       home = env.home
       await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
       await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
 
-      const { status, body } = await env.call('test-provider', { providerId: PROVIDER })
-      assert.equal(status, 200)
-      assert.equal(body.results.length, 2)
-      const byLabel = Object.fromEntries(body.provider.accounts.map((account) => [account.label, account.lastTest.state]))
+      const job = await env.runJob('provider-accounts', { providerId: PROVIDER })
+      assert.equal(job.status, 'done')
+      assert.equal(job.total, 2)
+      assert.equal(job.done, 2)
+      assert.equal(job.ok, 1)
+      assert.equal(job.failed, 1)
+      const state = (await env.call('state')).body.providers[0]
+      const byLabel = Object.fromEntries(state.accounts.map((account) => [account.label, account.lastTest.state]))
       assert.deepEqual(byLabel, { A: 'ok', B: 'invalid' })
       // Each probe observed its own account's key on the route ref.
       const probes = env.streamCalls.filter((call) => call[TEST_MARKER] === true)
@@ -535,12 +575,13 @@ describe('dsh-multi-account', () => {
       await env.call('add', { providerId: PROVIDER, apiKey: 'sk-bbb' })
       await env.call('add', { providerId: 'openrouter', ref: OPENROUTER_REF, apiKey: 'sk-or-1' })
 
-      const { status, body } = await env.call('test-all')
-      assert.equal(status, 200)
-      assert.equal(body.results.length, 3)
-      assert.deepEqual([...new Set(body.results.map((r) => r.providerId))].sort(), ['deepseek', 'openrouter'])
-      assert.ok(body.results.every((r) => r.state === 'ok'))
-      assert.ok(body.providers.find((p) => p.providerId === 'openrouter').accounts[0].lastTest.state === 'ok')
+      const job = await env.runJob('all-accounts')
+      assert.equal(job.status, 'done')
+      assert.equal(job.results.length, 3)
+      assert.deepEqual([...new Set(job.results.map((r) => r.providerId))].sort(), ['deepseek', 'openrouter'])
+      assert.ok(job.results.every((r) => r.state === 'ok'))
+      const openrouter = (await env.call('state')).body.providers.find((p) => p.providerId === 'openrouter')
+      assert.equal(openrouter.accounts[0].lastTest.state, 'ok')
       assert.equal(await env.refValue(), 'sk-aaa')
       assert.equal(await env.app.credentials.resolve(OPENROUTER_REF).then((h) => h?.value), 'sk-or-1')
     })
@@ -629,7 +670,7 @@ describe('dsh-multi-account', () => {
       const missingAccount = await env.call('test-account', { providerId: PROVIDER, accountId: 'acct_nope' })
       assert.equal(missingAccount.status, 404)
       assert.equal(missingAccount.body.code, 'NOT_FOUND')
-      const missingProvider = await env.call('test-provider', { providerId: 'ghost' })
+      const missingProvider = await env.call('test-start', { scope: 'provider-accounts', providerId: 'ghost' })
       assert.equal(missingProvider.status, 404)
     })
   })
@@ -707,12 +748,13 @@ describe('dsh-multi-account', () => {
       })
       home = env.home
       await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
-      const { status, body } = await env.call('test-provider-models', { providerId: PROVIDER })
-      assert.equal(status, 200)
-      assert.deepEqual(body.results.map((r) => r.model), ['m-1', 'm-2'])
-      assert.ok(body.results.every((r) => r.state === 'ok'))
-      assert.deepEqual(body.models.map((m) => m.id), ['m-1', 'm-2'])
-      assert.ok(body.models.every((m) => m.lastTest?.state === 'ok'))
+      const job = await env.runJob('provider-models', { providerId: PROVIDER })
+      assert.equal(job.status, 'done')
+      assert.deepEqual(job.results.map((r) => r.model), ['m-1', 'm-2'])
+      assert.ok(job.results.every((r) => r.state === 'ok'))
+      const listed = await env.call('models', { providerId: PROVIDER })
+      assert.deepEqual(listed.body.models.map((m) => m.id), ['m-1', 'm-2'])
+      assert.ok(listed.body.models.every((m) => m.lastTest?.state === 'ok'))
       const probes = env.streamCalls.filter((call) => call[MODEL_TEST_MARKER] === true)
       assert.deepEqual(probes.map((call) => call.model), ['m-1', 'm-2'])
     })
@@ -722,11 +764,11 @@ describe('dsh-multi-account', () => {
       home = env.home
       await env.app.credentials.set(REF, 'sk-deep')
       await env.app.credentials.set(OPENROUTER_REF, 'sk-or')
-      const { status, body } = await env.call('test-all-models')
-      assert.equal(status, 200)
-      assert.equal(body.results.length, 2)
-      assert.deepEqual([...new Set(body.results.map((r) => r.providerId))].sort(), ['deepseek', 'openrouter'])
-      assert.ok(body.results.every((r) => r.state === 'ok' && r.model === 'test-model'))
+      const job = await env.runJob('all-models')
+      assert.equal(job.status, 'done')
+      assert.equal(job.results.length, 2)
+      assert.deepEqual([...new Set(job.results.map((r) => r.providerId))].sort(), ['deepseek', 'openrouter'])
+      assert.ok(job.results.every((r) => r.state === 'ok' && r.model === 'test-model'))
     })
 
     it('never rotates the active account while testing models, even in round-robin mode', async () => {
@@ -780,9 +822,11 @@ describe('dsh-multi-account', () => {
       assert.equal(badModel.body.code, 'BAD_REQUEST')
       const badProvider = await env.call('test-model', { providerId: '', model: 'x' })
       assert.equal(badProvider.status, 400)
-      const nothing = await env.call('test-provider-models', { providerId: PROVIDER })
+      const nothing = await env.call('test-start', { scope: 'provider-models', providerId: PROVIDER })
       assert.equal(nothing.status, 409)
       assert.equal(nothing.body.code, 'NO_MODEL')
+      const badScope = await env.call('test-start', { scope: 'bogus', providerId: PROVIDER })
+      assert.equal(badScope.status, 400)
     })
 
     it('serializes concurrent model probes through the shared provider lock', async () => {
@@ -826,6 +870,251 @@ describe('dsh-multi-account', () => {
         assert.deepEqual((await third.snapshot()).modelTests, {})
       } finally {
         await rm(directory, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe('background batch jobs', () => {
+    /** Wait until the mock llm has received `count` probe calls. */
+    async function waitForProbes(env, count) {
+      for (let i = 0; i < 100; i += 1) {
+        if (env.streamCalls.length >= count) return
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      throw new Error(`timed out waiting for ${count} probes, saw ${env.streamCalls.length}`)
+    }
+
+    it('reports progress while running and aborts on demand', async () => {
+      const env = await harness({ hang: true, testTimeoutMs: 5000 })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+
+      const started = await env.call('test-start', { scope: 'provider-accounts', providerId: PROVIDER })
+      assert.equal(started.status, 200)
+      assert.equal(started.body.status, 'running')
+      assert.equal(started.body.total, 2)
+      await waitForProbes(env, 1)
+
+      // Re-attachment seam for a reopened modal.
+      const active = await env.call('test-active')
+      assert.equal(active.body.jobs.length, 1)
+      assert.equal(active.body.jobs[0].id, started.body.id)
+
+      const aborted = await env.call('test-abort', { jobId: started.body.id })
+      assert.equal(aborted.status, 200)
+      const final = await env.runJobLoopUntilTerminal(started.body.id)
+      assert.equal(final.status, 'aborted')
+      assert.equal(final.done, 1)
+      assert.equal(final.failed, 1)
+      assert.equal(final.results[0].code, 'ABORTED')
+      // The second probe never started.
+      assert.equal(env.streamCalls.filter((call) => call[TEST_MARKER]).length, 1)
+      // The first key was restored despite the abort.
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('rejects a second concurrent job with 409', async () => {
+      const env = await harness({ hang: true, testTimeoutMs: 5000 })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const first = await env.call('test-start', { scope: 'provider-accounts', providerId: PROVIDER })
+      assert.equal(first.status, 200)
+      await waitForProbes(env, 1)
+      const second = await env.call('test-start', { scope: 'all-accounts' })
+      assert.equal(second.status, 409)
+      assert.equal(second.body.code, 'JOB_RUNNING')
+      await env.call('test-abort', { jobId: first.body.id })
+      await env.runJobLoopUntilTerminal(first.body.id)
+    })
+
+    it('returns 404 for unknown jobs on progress and abort routes', async () => {
+      const env = await harness()
+      home = env.home
+      const progress = await env.call('test-progress', { jobId: 'job_nope' })
+      assert.equal(progress.status, 404)
+      const abort = await env.call('test-abort', { jobId: 'job_nope' })
+      assert.equal(abort.status, 404)
+    })
+
+    it('keeps only a bounded number of finished jobs', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const ids = []
+      for (let i = 0; i < 8; i += 1) {
+        const job = await env.runJob('provider-accounts', { providerId: PROVIDER })
+        ids.push(job.id)
+      }
+      // The cap is 5; the oldest job id must have been evicted.
+      const oldest = await env.call('test-progress', { jobId: ids[0] })
+      assert.equal(oldest.status, 404)
+      const newest = await env.call('test-progress', { jobId: ids[7] })
+      assert.equal(newest.status, 200)
+      assert.equal(newest.body.status, 'done')
+    })
+  })
+
+  describe('health-aware round robin', () => {
+    it('parks flagged accounts during the cooldown and only rotates healthy ones', async () => {
+      const env = await harness({ cooldownMs: 10 * 60 * 1000 })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      await env.call('add', { providerId: PROVIDER, label: 'C', apiKey: 'sk-ccc' })
+      await env.call('mode', { providerId: PROVIDER, mode: 'round-robin' })
+
+      // Mark A exhausted; on-error handling rotates the active account to B.
+      const failure = await env.requestError('QUOTA')
+      assert.deepEqual(failure.result, { kind: 'retry' })
+      const flagged = (await env.call('state')).body.providers[0].accounts.find((a) => a.label === 'A')
+      assert.equal(flagged.status.state, 'exhausted')
+
+      // From B, healthy rotation goes to C and then back to B — A never wins.
+      await env.stream()
+      assert.equal(await env.refValue(), 'sk-ccc')
+      await env.stream()
+      assert.equal(await env.refValue(), 'sk-bbb')
+      await env.stream()
+      assert.equal(await env.refValue(), 'sk-ccc')
+    })
+
+    it('re-admits a parked account once the cooldown has elapsed', async () => {
+      const env = await harness({ cooldownMs: 30 })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      await env.call('mode', { providerId: PROVIDER, mode: 'round-robin' })
+      await env.requestError('QUOTA')
+      assert.equal(await env.refValue(), 'sk-bbb')
+
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      // A is eligible again: from B the next rotation slot reaches A.
+      await env.stream()
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('falls back to flagged accounts when every enabled account is unhealthy', async () => {
+      const env = await harness({ cooldownMs: 60000 })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('add', { providerId: PROVIDER, label: 'B', apiKey: 'sk-bbb' })
+      await env.call('mode', { providerId: PROVIDER, mode: 'round-robin' })
+      await env.requestError('QUOTA')
+      await env.requestError('QUOTA')
+      const states = (await env.call('state')).body.providers[0].accounts.map((a) => a.status.state)
+      assert.ok(states.every((state) => state === 'exhausted'))
+      // No healthy account exists, yet traffic must still pick someone.
+      const out = await env.stream()
+      assert.equal(out.result, 'stream-result')
+      assert.ok(['sk-aaa', 'sk-bbb'].includes(await env.refValue()))
+    })
+  })
+
+  describe('state housekeeping', () => {
+    it('deletes the provider section when its last account is removed', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      const account = (await env.call('state')).body.providers[0].accounts[0]
+      const removed = await env.call('remove', { providerId: PROVIDER, accountId: account.id })
+      assert.equal(removed.status, 200)
+      assert.equal(removed.body.provider.managed, false)
+      const persisted = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      assert.deepEqual(persisted.providers, {})
+      // The route ref itself keeps the key (pre-managed state).
+      assert.equal(await env.refValue(), 'sk-aaa')
+    })
+
+    it('prunes model test results for models the provider no longer exposes', async () => {
+      const catalog = new Map([[PROVIDER, [
+        { provider: PROVIDER, id: 'm-1', name: 'One' },
+        { provider: PROVIDER, id: 'm-2', name: 'Two' },
+      ]]])
+      const env = await harness({ catalogModels: catalog })
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, apiKey: 'sk-aaa' })
+      await env.runJob('provider-models', { providerId: PROVIDER })
+
+      catalog.set(PROVIDER, [{ provider: PROVIDER, id: 'm-1', name: 'One' }])
+      const listed = await env.call('models', { providerId: PROVIDER })
+      assert.deepEqual(listed.body.models.map((m) => m.id), ['m-1'])
+      const persisted = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      assert.deepEqual(Object.keys(persisted.modelTests[PROVIDER]), ['m-1'])
+    })
+
+    it('forget-provider removes the section, model tests and stored account refs', async () => {
+      const env = await harness()
+      home = env.home
+      await env.call('add', { providerId: PROVIDER, label: 'A', apiKey: 'sk-aaa' })
+      await env.call('test-model', { providerId: PROVIDER, model: 'test-model' })
+      const before = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      const credentialRef = before.providers[PROVIDER].accounts[0].credentialRef
+      assert.ok(await env.app.credentials.resolve(credentialRef))
+
+      const forgotten = await env.call('forget-provider', { providerId: PROVIDER })
+      assert.equal(forgotten.status, 200)
+      assert.equal(forgotten.body.providers.find((p) => p.providerId === PROVIDER).managed, false)
+      const after = JSON.parse(await readFile(join(home, 'multi-account', 'state.json'), 'utf8'))
+      assert.deepEqual(after.providers, {})
+      assert.equal(after.modelTests[PROVIDER], undefined)
+      assert.equal(await env.app.credentials.resolve(credentialRef), undefined)
+
+      const again = await env.call('forget-provider', { providerId: 'ghost' })
+      assert.equal(again.status, 404)
+    })
+  })
+
+  describe('unload handling', () => {
+    it('dispose aborts a running job and every in-flight probe', async () => {
+      const home2 = await mkdtemp(join(tmpdir(), 'dsh-ma-dispose-'))
+      const startedProbes = []
+      try {
+        const ctx = {
+          logger: { info() {}, warn() {}, error() {} },
+          get: () => undefined,
+          on: () => () => undefined,
+          credentials: await (async () => {
+            const app = new Context()
+            await app.plugin(LocalCredentialProvider, {
+              path: join(home2, '.credentials.yaml'),
+              dshHome: home2,
+              watch: false,
+            })
+            return app.credentials
+          })(),
+          llm: {
+            listConfigurableProviders: async () => [{ provider: PROVIDER, displayName: 'DeepSeek', settingsNs: 'llm-pi-ai' }],
+            listModels: async () => [{ provider: PROVIDER, id: 'test-model', name: 'Test Model' }],
+            async *stream(options) {
+              startedProbes.push(options)
+              await new Promise((resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })), { once: true })
+              })
+              yield { type: 'text', text: 'OK' }
+            },
+          },
+        }
+        const store = new StateStore(join(home2, 'multi-account'))
+        const directory = new plugin.ProviderDirectory(ctx)
+        const manager = new plugin.AccountManager(ctx, store, directory, { testTimeoutMs: 60000 })
+        const job = await manager.startJob({ scope: 'all-models' })
+        for (let i = 0; i < 100 && startedProbes.length === 0; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        assert.equal(startedProbes.length, 1)
+        manager.dispose()
+        for (let i = 0; i < 100; i += 1) {
+          const view = manager.jobProgress({ jobId: job.id })
+          if (view.status !== 'running') {
+            assert.equal(view.status, 'aborted')
+            return
+          }
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        assert.fail('job did not abort after dispose')
+      } finally {
+        await rm(home2, { recursive: true, force: true })
       }
     })
   })

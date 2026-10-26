@@ -43,7 +43,7 @@ npm test
 npm pack
 ```
 
-Daraus entsteht `dsh-multi-account-1.1.0.tgz`. Ein fertiges Release-TGZ
+Daraus entsteht `dsh-multi-account-1.2.0.tgz`. Ein fertiges Release-TGZ
 muss nicht erneut gebaut werden.
 
 ### 2. In DSH Desktop installieren
@@ -66,7 +66,7 @@ die `dsh`-CLI über die Installation bzw. die Shims unter
 `<DSH_HOME>\.desktop-bin` mit. Lokale Pfade müssen absolut sein:
 
 ```powershell
-dsh plugin --profile web add "C:\Pfad\zu\dsh-multi-account-1.1.0.tgz"
+dsh plugin --profile web add "C:\Pfad\zu\dsh-multi-account-1.2.0.tgz"
 ```
 
 Anschließend DSH Desktop vollständig neu starten. Ob die jeweilige
@@ -107,6 +107,17 @@ beim Account an:
   providers“; läuft durch sämtliche verwalteten Anbieter (max. 100
   Accounts pro Lauf).
 
+Alle Mehrziel-Läufe (Provider- und Alle-Ebene) laufen als Hintergrund-Job:
+Das Fenster zeigt den Fortschritt (`erledigt/gesamt`, Anzahl erfolgreich
+und fehlgeschlagen) live an, statt auf eine blockierende Antwort zu
+warten. Über **Abort** kann der Lauf jederzeit gestoppt werden — die
+bereits geprüften Accounts bleiben mit ihren Ergebnissen stehen, der
+unterbrochene Prüfschritt wird als `ABORTED` verbucht. Ein erneutes
+Öffnen des Fensters hängt sich an einen noch laufenden Job an; das
+Schließen des Fensters bricht den Server-Lauf nicht ab. Einzelne
+Account-Tests bleiben direkte, kurze Anfragen mit Drehanzeige in der
+Zeile.
+
 Dabei wird der zu prüfende Key nur vorübergehend in die
 Credential-Variable des Providers geschrieben und nach dem Lauf
 vollständig wiederhergestellt — der aktive Account, Round-Robin-Stand
@@ -135,6 +146,10 @@ ob das konkrete Modell eine Minimalanfrage annimmt:
   providers“; durchläuft alle konfigurierbaren Provider (max. 100
   Prüfungen pro Lauf), auch solche ohne verwaltete Accounts.
 
+Auch die Modell-Sammeltests laufen über denselben Job-Mechanismus mit
+Fortschrittsanzeige und **Abort**; der Einzeltest pro Modell bleibt eine
+direkte Anfrage.
+
 Modelltests rotieren keine Accounts (auch nicht im Round-Robin-Modus),
 verändern keinen Credential-Stand und schreiben ihre Ergebnisse
 (Status, Code, Latenz) separat in die `state.json`
@@ -147,11 +162,32 @@ weil ein Modell geprüft wurde.
 | --- | --- |
 | **Manual** | Aktiver Account bleibt fix; Fehler werden nur als Statusmarkierung (z. B. „Quota exhausted“) am Account angezeigt. |
 | **On error** | Bei `AUTH`/`INVALID_CREDENTIAL`/`QUOTA`/`ACCOUNT_QUOTA`/`RATE_LIMIT` wird der nächste geeignete, aktivierte Account aktiviert und dieselbe Anfrage automatisch wiederholt (`{ kind: 'retry' }`). Gibt es keinen anderen aktiven Account, läuft die normale Fehlerbehandlung weiter. |
-| **Round robin** | Vor jeder Anfrage wird zyklisch auf den nächsten aktivierten Account gewechselt; schlägt einer zu, greift zusätzlich die On-error-Logik. |
+| **Round robin** | Vor jeder Anfrage wird zyklisch auf den nächsten *gesunden*, aktivierten Account gewechselt; schlägt einer zu, greift zusätzlich die On-error-Logik. |
 
 Deaktivierte Accounts werden nie verwendet. Accounts mit Fehlerstatus
-werden nachrangig behandelt und können über **Clear flag** zurückgesetzt
-werden.
+(`exhausted`, `invalid`, `rate_limited`, `error`) werden im Round-Robin-
+Modus für eine Abkühlzeit „geparkt“ und erhalten in dieser Zeit keinen
+neuen Traffic — die Rotation springt zum nächsten gesunden Account.
+Sind gerade alle Accounts gezeichnet, greift ein Fallback auf den
+vollständigen aktivierten Pool, damit die Anfrage nicht blockiert wird.
+Die Abkühlzeit ist über die Plugin-Config einstellbar
+(`cooldownMs`, Standard 60000 ms, gemessen ab dem Zeitstempel der
+Statusmarkierung). Markierungen lassen sich jederzeit über
+**Clear flag** zurücksetzen.
+
+### Anbieter vollständig vergessen
+
+Unterhalb der Account-Liste bietet **Forget provider** (mit
+Bestätigungsschritt) die komplette Haushaltsauflösung eines Providers:
+Alle verwalteten Account-Credentials werden aus dem Credential-Store
+entfernt, die Provider-Sektion und alle gespeicherten Modelltestergebnisse
+werden aus der `state.json` gelöscht. Die Credential-Referenz des
+Providers selbst bleibt erhalten, danach ist der Anbieter wieder
+„unverwaltet“ wie vor der ersten Account-Einrichtung. Entfernt man
+ohnehin den letzten Account einzeln, wird die leere Provider-Sektion
+automatisch gelöscht; veraltete `modelTests`-Einträge werden beim
+nächsten Modell-Laden automatisch aussortiert, sodass die Zustandsdatei
+nicht endlos wächst.
 
 ### Wo liegen die Daten?
 
@@ -182,7 +218,7 @@ npm test
 npm pack
 ```
 
-This produces `dsh-multi-account-1.1.0.tgz`.
+This produces `dsh-multi-account-1.2.0.tgz`.
 
 ### Install
 
@@ -191,7 +227,7 @@ package” flow, or the bundled `dsh` CLI with an **absolute** tarball
 path:
 
 ```powershell
-dsh plugin --profile web add "C:\path\to\dsh-multi-account-1.1.0.tgz"
+dsh plugin --profile web add "C:\path\to\dsh-multi-account-1.2.0.tgz"
 ```
 
 Then fully quit and reopen DSH Desktop. Check `dsh plugin --help` if a
@@ -218,6 +254,15 @@ outcome (health state, error code, latency) on the account:
   providers*, iterating all managed providers (capped at 100 accounts
   per run).
 
+Every multi-target run (both provider and all-providers scope) executes
+as a background job: the window polls and renders live progress
+(`done/total`, ok and failed counts) instead of awaiting one blocking
+request, and an **Abort** button stops the run at any moment — finished
+probes keep their results, the interrupted probe is recorded as
+`ABORTED`. Reopening the modal re-attaches to a still-running job;
+closing the window does not cancel the server-side job. Single-account
+probes remain direct, short requests with a spinner on the row.
+
 The key under test is committed to the provider's credential variable
 only for the duration of the probe and restored afterwards, so the
 active account, round-robin cursor and live traffic are unaffected.
@@ -241,10 +286,36 @@ accounts) and checks that the exact model accepts a minimal request:
   providers*, walking every configurable provider (capped at 100
   probes per run), including ones without managed accounts.
 
+Batch model runs use the same job engine with live progress and
+**Abort**; the per-model probe stays a direct request.
+
 Model probes never rotate accounts (not even in round-robin mode),
 never alter the credential store, and persist their results (state,
 code, latency) separately in `state.json` (`modelTests`), so testing a
 model never turns a provider into a managed one.
+
+### Health-aware round robin
+
+In round-robin mode, accounts flagged with `exhausted`, `invalid`,
+`rate_limited` or `error` are parked for a cooldown window
+(`cooldownMs`, default 60000 ms, measured from the flag's timestamp)
+and receive no new traffic while parked; rotation skips to the next
+healthy enabled account. If every account is flagged, a fallback to
+the full enabled pool keeps requests moving. Manual mode and the
+on-error retry path are unchanged, and **Clear flag** clears a parked
+state immediately.
+
+### Forgetting a provider
+
+Below the account list, **Forget provider** (with a confirmation step)
+performs full housekeeping for one provider: every managed account
+credential is removed from the credential store, and both the provider
+section and its model-test results are deleted from `state.json`. The
+key saved on the provider's own route ref is left untouched, so the
+provider returns to its pre-managed state. Removing the last account
+directly also deletes the now-empty provider section, and stale
+`modelTests` entries are pruned on the next model load, keeping the
+state document bounded.
 
 ### Data locations
 
@@ -261,10 +332,13 @@ model never turns a provider into a managed one.
 | --- | --- |
 | UI entry | Keyed client slot `settings.models.provider-card` (one contribution per settings namespace, rendered per provider row), opening a host-`Modal` built from `dsh-client-ui-primitives`. |
 | Client/server transport | Plugin-owned routes under `/api/multi-account.*`, registered with `ctx.connection.fetch.register`; buffered, bounded JSON, no secrets on read responses. |
-| Account tests | `test-account` / `test-provider` / `test-all` routes temporarily commit one key, invoke `ctx.llm.stream` with a one-token probe (marked internally so the plugin's own listener skips rotation), classify the result and always restore the previous credential; per-provider locking serializes the swaps. |
-| Model tests | `models` / `test-model` / `test-provider-models` / `test-all-models` routes resolve models from the adapter catalog (profile fallback) and probe each exact model on the already-committed active key under a second internal marker that suppresses rotation only; results persist in the separate `modelTests` map and the same per-provider lock covers both probe families. |
+| Account tests | The single-target `test-account` route temporarily commits one key, invokes `ctx.llm.stream` with a one-token probe (marked internally so the plugin's own listener skips rotation), classifies the result and always restores the previous credential; per-provider locking serializes the swaps. |
+| Batch test jobs | Multi-target runs no longer block one HTTP request: `test-start` creates a background job (plan resolved up front, one running job at a time, capped at 100 probes and 5 retained finished jobs), `test-progress` polls it and `test-abort` cancels it via `AbortSignal.any` (job signal + external signal + timeout); `test-active` lets a reopened modal re-attach. The interrupted probe is persisted as an `ABORTED` failure. |
+| Model tests | `models` / `test-model` resolve models from the adapter catalog (profile fallback) and probe the exact model on the already-committed active key under a second internal marker that suppresses rotation only; batch model runs go through the same job engine, results persist in the separate `modelTests` map and the same per-provider lock covers both probe families. |
 | Secret storage | `ctx.credentials.set/unset/resolve`; each account owns a generated credential ref, the active account's value is committed to the provider's own ref (the exact value `llm-pi-ai` resolves per request). |
-| Round robin / enforcement | Prepended global `llm/stream` waterfall listener; rotates the cursor and commits the key before the adapter resolves the credential. |
+| Round robin / enforcement | Prepended global `llm/stream` waterfall listener; rotates the cursor and commits the key before the adapter resolves the credential. Flagged accounts (`exhausted`, `invalid`, `rate_limited`, `error`) are parked for `cooldownMs` (default 60000 ms); the healthy enabled pool is preferred with a full-pool fallback, and selection runs inside the serialized state mutator. |
+| State housekeeping | `forget-provider` unsets all managed credential refs and deletes the provider section plus its `modelTests` row (route ref kept); removing the last account deletes the empty section, and model listing prunes stale/empty `modelTests` entries. |
+| Unload safety | Plugin teardown disposes the manager, which aborts every in-flight probe and running job and releases all per-provider locks; routes and slot contributions unregister through their disposers. |
 | Failover | Prepended global `agent/request-error` waterfall listener; classifies `AUTH`, `INVALID_CREDENTIAL`, `QUOTA`, `ACCOUNT_QUOTA`, `MISSING_CREDENTIAL` and `RATE_LIMIT`, marks the account, rotates and returns `{ kind: 'retry' }` — the same contract as the official `dsh-llm-retry` plugin. A per-step budget prevents retry loops. |
 | Provider/ref discovery | `ctx.llm.listConfigurableProviders()` plus the same `configEditor` seam the settings forms use, memoized and invalidated on `loader/volatile-update`. |
 | Persistence | One atomic, serialized `state.json` via `@deepseek-ai/dsh-atomic-write` (Windows rename-retry aware), file mode `0600`. |

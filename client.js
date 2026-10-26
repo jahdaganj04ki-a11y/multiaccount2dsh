@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
       IconUsersOutlineRegular, IconPlusOutlineRegular, IconRefreshOutlineRegular,
       IconPlayOutlineRegular, IconChecklistOutlineRegular,
       IconCheckCircleOutlineRegular, IconWarningOutlineRegular,
+      IconStopFillRegular, IconTrashOutlineRegular,
     } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const NS = 'dsh.multiAccount'
@@ -110,6 +111,14 @@ window.__ModuleLoader__.load({
       noModelsToTest: '暂无可测试的模型。',
       modelCount: '{count} 个模型',
       modelCountOne: '1 个模型',
+      abort: '中止',
+      abortTooltip: '中止当前测试批次',
+      jobProgress: '正在测试 {done}/{total}…',
+      jobAborted: '测试批次已中止。',
+      jobFailed: '测试批次失败：{message}',
+      forgetProvider: '移除此服务商',
+      confirmForget: '确认移除该服务商的全部账号、凭据和测试结果？',
+      confirmForgetYes: '移除',
     }
 
     const en = {
@@ -199,6 +208,14 @@ window.__ModuleLoader__.load({
       noModelsToTest: 'No models to test.',
       modelCount: '{count} models',
       modelCountOne: '1 model',
+      abort: 'Abort',
+      abortTooltip: 'Abort the running test batch',
+      jobProgress: 'Testing {done}/{total}…',
+      jobAborted: 'Test batch aborted.',
+      jobFailed: 'Test batch failed: {message}',
+      forgetProvider: 'Forget provider',
+      confirmForget: 'Remove all accounts, stored credentials and test results for this provider?',
+      confirmForgetYes: 'Remove',
     }
 
     const css = `
@@ -419,6 +436,7 @@ window.__ModuleLoader__.load({
       const [modelData, setModelData] = React.useState(null)
       const [modelsLoading, setModelsLoading] = React.useState(false)
       const [modelTestingIds, setModelTestingIds] = React.useState(() => new Set())
+      const [confirmingForget, setConfirmingForget] = React.useState(false)
 
       const refresh = React.useCallback(async () => {
         setLoading(true); setLoadError(false)
@@ -458,37 +476,20 @@ window.__ModuleLoader__.load({
         return { kind: 'error', text: t('testSummaryMixed', { ok, total, failed }) }
       }
 
-      const runTest = async (scope, account) => {
-        if (busy) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
-        const ids = scope === 'account'
-          ? [account.id]
-          : (provider?.accounts ?? []).map((candidate) => candidate.id)
-        // The global batch may still have work on other providers even when
-        // the currently open one has no accounts.
-        if (scope !== 'all' && ids.length === 0) {
-          setNotice({ kind: 'error', text: t('testAllEmpty') }); return
-        }
+      // Single-account probe stays synchronous: one bounded request with its
+      // own row spinner; every multi-target run goes through the job routes.
+      const runAccountTest = async (account) => {
+        if (busy || job) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
         setBusy(true)
-        setTestingIds(new Set(ids))
+        setTestingIds(new Set([account.id]))
         setNotice(null)
         try {
-          if (scope === 'account') {
-            const body = await callApi('test-account', { providerId: entry.provider, accountId: account.id })
-            if (body?.provider) setProvider(body.provider)
-            const result = body?.result
-            setNotice(result?.state === 'ok'
-              ? { kind: 'ok', text: t('testPassed', { latency: result.latencyMs ?? 0 }) }
-              : { kind: 'error', text: t('testFailed', { code: result?.code ?? t('statusUnknown') }) })
-          } else if (scope === 'provider') {
-            const body = await callApi('test-provider', { providerId: entry.provider })
-            if (body?.provider) setProvider(body.provider)
-            setNotice(summarizeResults(body?.results))
-          } else {
-            const body = await callApi('test-all')
-            const current = body?.providers?.find((candidate) => candidate.providerId === entry.provider)
-            if (current) setProvider(current)
-            setNotice(summarizeResults(body?.results))
-          }
+          const body = await callApi('test-account', { providerId: entry.provider, accountId: account.id })
+          if (body?.provider) setProvider(body.provider)
+          const result = body?.result
+          setNotice(result?.state === 'ok'
+            ? { kind: 'ok', text: t('testPassed', { latency: result.latencyMs ?? 0 }) }
+            : { kind: 'error', text: t('testFailed', { code: result?.code ?? t('statusUnknown') }) })
         } catch (error) {
           setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
         } finally {
@@ -496,6 +497,90 @@ window.__ModuleLoader__.load({
           setTestingIds(new Set())
         }
       }
+
+      // ---- Background batch jobs ----------------------------------------
+      const [job, setJob] = React.useState(null)
+      const pollTimer = React.useRef(null)
+      const stopPolling = React.useCallback(() => {
+        if (pollTimer.current) { clearTimeout(pollTimer.current); pollTimer.current = null }
+      }, [])
+
+      React.useEffect(() => stopPolling, [stopPolling])
+
+      /** Reflect one job snapshot in the row-spinner and notice state. */
+      const applyJobSnapshot = React.useCallback((snapshot) => {
+        setJob(snapshot.status === 'running' ? snapshot : null)
+        const isAccountJob = snapshot.scope === 'provider-accounts' || snapshot.scope === 'all-accounts'
+        const doneIds = new Set((snapshot.results ?? []).map((row) => (isAccountJob ? row.accountId : row.model)))
+        if (isAccountJob) {
+          const local = (provider?.accounts ?? []).map((account) => account.id).filter((id) => !doneIds.has(id))
+          setTestingIds(snapshot.status === 'running' ? new Set(local) : new Set())
+        } else {
+          const local = (modelData?.models ?? []).map((model) => model.id).filter((id) => !doneIds.has(id))
+          setModelTestingIds(snapshot.status === 'running' ? new Set(local) : new Set())
+        }
+        if (snapshot.status === 'running') {
+          setNotice({ kind: 'ok', text: t('jobProgress', { done: snapshot.done, total: snapshot.total }) })
+        } else if (snapshot.status === 'aborted') {
+          setNotice({ kind: 'error', text: t('jobAborted') })
+        } else if (snapshot.status === 'error') {
+          setNotice({ kind: 'error', text: t('jobFailed', { message: snapshot.error ?? '' }) })
+        } else if (isAccountJob) {
+          setNotice(summarizeResults(snapshot.results))
+        } else {
+          setNotice(summarizeModelResults(snapshot.results))
+        }
+      }, [modelData?.models, provider?.accounts, t])
+
+      const pollJob = React.useCallback(async (jobId) => {
+        try {
+          const snapshot = await callApi('test-progress', { jobId })
+          applyJobSnapshot(snapshot)
+          if (snapshot.status === 'running') {
+            pollTimer.current = setTimeout(() => void pollJob(jobId), 600)
+            return
+          }
+        } catch {
+          setJob(null)
+        }
+        stopPolling()
+        // Terminal runs committed results into state; refresh both views.
+        await Promise.all([refresh(), loadModels()])
+      }, [applyJobSnapshot, callApi, loadModels, refresh, stopPolling])
+
+      const startBatch = React.useCallback(async (scope) => {
+        if (busy || job) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
+        setNotice(null)
+        try {
+          const snapshot = await callApi('test-start', { scope, providerId: entry.provider })
+          setJob(snapshot)
+          await pollJob(snapshot.id)
+        } catch (error) {
+          setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
+        }
+      }, [busy, job, callApi, entry.provider, pollJob, t])
+
+      const abortJob = React.useCallback(async () => {
+        if (!job) return
+        try {
+          const snapshot = await callApi('test-abort', { jobId: job.id })
+          applyJobSnapshot({ ...snapshot, status: 'running' })
+        } catch (error) {
+          setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
+        }
+      }, [callApi, job, applyJobSnapshot, t])
+
+      // Re-attach to a job already running when the modal is (re)opened.
+      React.useEffect(() => {
+        let cancelled = false
+        callApi('test-active').then((data) => {
+          if (cancelled) return
+          const running = (data?.jobs ?? []).find((candidate) =>
+            candidate.scope?.startsWith('all-') || candidate.providerId === entry.provider)
+          if (running) void pollJob(running.id)
+        }).catch(() => undefined)
+        return () => { cancelled = true }
+      }, [callApi, entry.provider, pollJob])
 
       const summarizeModelResults = (results) => {
         const total = Array.isArray(results) ? results.length : 0
@@ -520,35 +605,21 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { void loadModels() }, [loadModels])
 
-      const runModelTest = async (scope, model) => {
-        if (busy) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
-        const ids = scope === 'model' ? [model.id] : (modelData?.models ?? []).map((item) => item.id)
-        if (scope !== 'all' && ids.length === 0) {
-          setNotice({ kind: 'error', text: t('noModelsToTest') }); return
-        }
+      const runSingleModelTest = async (model) => {
+        if (busy || job) { setNotice({ kind: 'error', text: t('saveBlocked') }); return }
         setBusy(true)
-        setModelTestingIds(new Set(ids))
+        setModelTestingIds(new Set([model.id]))
         setNotice(null)
         try {
-          if (scope === 'model') {
-            const body = await callApi('test-model', { providerId: entry.provider, model: model.id })
-            const result = body?.result
-            setModelData((current) => (current ? {
-              ...current,
-              models: current.models.map((item) => item.id === model.id ? { ...item, lastTest: result } : item),
-            } : current))
-            setNotice(result?.state === 'ok'
-              ? { kind: 'ok', text: t('testPassed', { latency: result.latencyMs ?? 0 }) }
-              : { kind: 'error', text: t('testFailed', { code: result?.code ?? t('statusUnknown') }) })
-          } else if (scope === 'provider') {
-            const body = await callApi('test-provider-models', { providerId: entry.provider })
-            setModelData((current) => ({ ...(current ?? { providerId: entry.provider }), models: body?.models ?? [] }))
-            setNotice(summarizeModelResults(body?.results))
-          } else {
-            const body = await callApi('test-all-models')
-            setNotice(summarizeModelResults(body?.results))
-            await loadModels()
-          }
+          const body = await callApi('test-model', { providerId: entry.provider, model: model.id })
+          const result = body?.result
+          setModelData((current) => (current ? {
+            ...current,
+            models: current.models.map((item) => item.id === model.id ? { ...item, lastTest: result } : item),
+          } : current))
+          setNotice(result?.state === 'ok'
+            ? { kind: 'ok', text: t('testPassed', { latency: result.latencyMs ?? 0 }) }
+            : { kind: 'error', text: t('testFailed', { code: result?.code ?? t('statusUnknown') }) })
         } catch (error) {
           setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
         } finally {
@@ -557,7 +628,25 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const guardedClose = () => { if (!busy) onClose() }
+      const forgetProvider = async () => {
+        if (busy || job) return
+        setBusy(true)
+        try {
+          const body = await callApi('forget-provider', { providerId: entry.provider })
+          const current = body?.providers?.find((candidate) => candidate.providerId === entry.provider)
+          if (current) setProvider(current)
+          setModelData((data) => (data ? { ...data, models: data.models.map((model) => ({ ...model, lastTest: null })) } : data))
+          setNotice({ kind: 'ok', text: t('operationOk') })
+        } catch (error) {
+          setNotice({ kind: 'error', text: t('operationFailed', { message: error?.message ?? '' }) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      // The modal may close while a job keeps running server-side; polling is
+      // stopped on unmount, and test-active lets a reopened modal re-attach.
+      const guardedClose = () => onClose()
       const modeOptions = [
         { value: 'manual', label: t('modeManual') },
         { value: 'on-error', label: t('modeOnError') },
@@ -604,16 +693,24 @@ window.__ModuleLoader__.load({
                         `${t('accountsHeading')} · ${provider?.accounts?.length ? t('accountCount', { count: provider.accounts.length }) : t('none')}`),
                       h(Tooltip, { label: t('testProvider') },
                         h(Button, {
-                          variant: 'outline', size: 'sm', disabled: busy || !provider?.accounts?.length,
+                          variant: 'outline', size: 'sm', disabled: busy || Boolean(job) || !provider?.accounts?.length,
                           icon: h(IconPlayOutlineRegular, { size: 14 }),
-                          onClick: () => runTest('provider'),
+                          onClick: () => startBatch('provider-accounts'),
                         }, t('testProvider'))),
                       h(Tooltip, { label: t('testAllProviders') },
                         h(Button, {
-                          variant: 'ghost', size: 'sm', disabled: busy,
+                          variant: 'ghost', size: 'sm', disabled: busy || Boolean(job),
                           icon: h(IconChecklistOutlineRegular, { size: 14 }),
-                          onClick: () => runTest('all'),
-                        }, t('testAllProviders')))),
+                          onClick: () => startBatch('all-accounts'),
+                        }, t('testAllProviders'))),
+                      job
+                        ? h(Tooltip, { label: t('abortTooltip') },
+                            h(Button, {
+                              variant: 'outline', size: 'sm', className: 'dshMaDanger',
+                              icon: h(IconStopFillRegular, { size: 14 }),
+                              onClick: abortJob,
+                            }, t('abort')))
+                        : null),
                     provider?.accounts?.length
                       ? h('ul', { className: 'dshMaList', style: { listStyle: 'none', margin: 0, padding: 0 } },
                           h('li', { className: 'dshMaListHead', 'aria-hidden': true },
@@ -622,9 +719,9 @@ window.__ModuleLoader__.load({
                             h('span', null, t('columnEnabled')),
                             h('span', null, t('columnActions'))),
                           provider.accounts.map((account) => h(AccountRow, {
-                            key: account.id, account, mode: provider.mode, busy,
+                            key: account.id, account, mode: provider.mode, busy: busy || Boolean(job),
                             testing: testingIds.has(account.id), t,
-                            onTest: (target) => runTest('account', target),
+                            onTest: (target) => runAccountTest(target),
                             onSwitch: (target) => run(() => callApi('switch', { providerId: entry.provider, accountId: target.id })),
                             onToggle: (target, enabled) => run(() => callApi('toggle', { providerId: entry.provider, accountId: target.id, enabled })),
                             onRemove: (target) => run(() => callApi('remove', { providerId: entry.provider, accountId: target.id })),
@@ -640,24 +737,24 @@ window.__ModuleLoader__.load({
                       h(Tooltip, { label: t('testProviderModels') },
                         h(Button, {
                           variant: 'outline', size: 'sm',
-                          disabled: busy || !modelData?.models?.length,
+                          disabled: busy || Boolean(job) || !modelData?.models?.length,
                           icon: h(IconPlayOutlineRegular, { size: 14 }),
-                          onClick: () => runModelTest('provider'),
+                          onClick: () => startBatch('provider-models'),
                         }, t('testProviderModels'))),
                       h(Tooltip, { label: t('testAllModels') },
                         h(Button, {
-                          variant: 'ghost', size: 'sm', disabled: busy,
+                          variant: 'ghost', size: 'sm', disabled: busy || Boolean(job),
                           icon: h(IconChecklistOutlineRegular, { size: 14 }),
-                          onClick: () => runModelTest('all'),
+                          onClick: () => startBatch('all-models'),
                         }, t('testAllModels')))),
                     modelsLoading
                       ? h('p', { className: 'dshMaNotice', role: 'status' }, t('loadingModels'))
                       : modelData?.models?.length
                         ? h('ul', { className: 'dshMaList', style: { listStyle: 'none', margin: 0, padding: 0 } },
                             modelData.models.map((model) => h(ModelRow, {
-                              key: model.id, model, busy,
+                              key: model.id, model, busy: busy || Boolean(job),
                               testing: modelTestingIds.has(model.id), t,
-                              onTest: (target) => runModelTest('model', target),
+                              onTest: (target) => runSingleModelTest(target),
                             })))
                         : h('p', { className: 'dshMaEmpty' }, t('noModels'))),
                   h(AddAccountForm, {
@@ -666,6 +763,25 @@ window.__ModuleLoader__.load({
                     onAdd: (payload) => run(() => callApi('add', { providerId: entry.provider, ...payload })),
                     onImport: () => run(() => callApi('import', { providerId: entry.provider })),
                   }),
+                  provider?.managed
+                    ? h('div', { className: 'dshMaBatchActions' },
+                        confirmingForget
+                          ? h(React.Fragment, null,
+                              h('span', { className: 'dshMaNotice', role: 'alert' }, t('confirmForget')),
+                              h(Button, { variant: 'outline', size: 'sm', disabled: busy || Boolean(job), onClick: () => setConfirmingForget(false) }, t('cancel')),
+                              h(Button, {
+                                variant: 'outline', size: 'sm', className: 'dshMaDanger', disabled: busy || Boolean(job),
+                                onClick: () => { setConfirmingForget(false); void forgetProvider() },
+                              }, t('confirmForgetYes'))
+                            )
+                          : h(Button, {
+                              variant: 'ghost', size: 'sm', className: 'dshMaDanger',
+                              disabled: busy || Boolean(job),
+                              icon: h(IconTrashOutlineRegular, { size: 14 }),
+                              onClick: () => setConfirmingForget(true),
+                            }, t('forgetProvider'))
+                      )
+                    : null,
                   h('p', { className: 'dshMaLive', role: 'status', 'aria-live': 'polite' },
                     notice ? h('span', { style: { color: notice.kind === 'error' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-secondary)' } }, notice.text) : null))))
     }
