@@ -1,0 +1,8 @@
+# dsh-multi-account: insert the server plugin into the Harness plugin tree.
+# `root` is this plugin's private data directory under the active DSH home
+# (state.json lives here; API keys themselves stay in the credentials store).
+- insert:
+    - id: dsh-multi-account
+      name: dsh-multi-account
+      config:
+        root: !!js dshHomePath('multi-account')
